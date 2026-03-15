@@ -1,9 +1,9 @@
-# import torch
 import cv2
 import imageio.v2 as imageio
 import logging
 import numpy as np
 from pycolmap import SceneManager
+import torch
 from tqdm import tqdm
 
 
@@ -132,9 +132,43 @@ def load_colmap(data_dir="colmap_data"):
 
     return camera_data
 
+
+class Dataset:
+    def __init__(self, camera_data, split="train", test_every=8):
+        self.camera_data = camera_data
+        camera_ids = sorted(camera_data.keys())
+        if split == "train":
+            self.camera_ids = [cid for i, cid in enumerate(camera_ids) if i % test_every != 0]
+        else:
+            self.camera_ids = [cid for i, cid in enumerate(camera_ids) if i % test_every == 0]
+
+    def __len__(self):
+        return len(self.camera_ids)
+    
+    def __getitem__(self, idx):
+        camera_id = self.camera_ids[idx]
+        data =self.camera_data[camera_id]
+        return {
+            "world_to_camera": torch.from_numpy(data.world_to_camera).float(),
+            "intrinsic": torch.from_numpy(data.intrinsic).float(),
+            "image": torch.from_numpy(data.image).float(),
+            "camera_id": camera_id
+        }
+
+
 def main():
     logging.info("Loading COLMAP data...")
     camera_data = load_colmap()
+
+    train_dataset = Dataset(camera_data, split="train")
+    train_dataloader = torch.utils.data.DataLoader(
+        train_dataset, batch_size=1, shuffle=True)
+    train_dataiter = iter(train_dataloader)
+
+    # training loop
+    max_steps = 1000
+    for step in tqdm(range(max_steps), desc="Training"):
+        data = next(train_dataiter)
 
 
 if __name__ == "__main__":
