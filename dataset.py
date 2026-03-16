@@ -56,7 +56,11 @@ def load_colmap(data_dir):
             world_to_camera, intrinsic, params, image_size, image_file, camtype
         )
 
-    return camera_data
+        # 3D points and RGB colors
+        points = scene_manager.points3D.astype(np.float32)
+        rgbs = scene_manager.point3D_colors.astype(np.uint8)
+
+    return camera_data, points, rgbs
 
 
 class Camera:
