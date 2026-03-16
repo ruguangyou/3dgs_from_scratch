@@ -3,6 +3,7 @@ import math
 import pickle
 import numpy as np
 import torch
+from fused_ssim import fused_ssim
 from tqdm import tqdm
 from sklearn.neighbors import NearestNeighbors
 from dataset import load_colmap, Dataset
@@ -39,15 +40,17 @@ def initialize(
     C0 = 0.28209479177387814  # DC component of SH basis
     sh_coeffs[:, 0, :] = (rgbs - 0.5) / C0  # Normalize to [-0.5, 0.5] and scale by C0
 
-    learnable_params = torch.nn.ParameterDict({
-        "means": torch.nn.Parameter(points),
-        "scales": torch.nn.Parameter(scales),
-        "quaternions": torch.nn.Parameter(quaternions),
-        "opacities": torch.nn.Parameter(opacities),
-        # dc and rest of the SH coefficients are separated to apply for different learning rates
-        "sh_coeffs_dc": torch.nn.Parameter(sh_coeffs[:, 0, :]),
-        "sh_coeffs_rest": torch.nn.Parameter(sh_coeffs[:, 1:, :]),
-    }).to(device)
+    learnable_params = torch.nn.ParameterDict(
+        {
+            "means": torch.nn.Parameter(points),
+            "scales": torch.nn.Parameter(scales),
+            "quaternions": torch.nn.Parameter(quaternions),
+            "opacities": torch.nn.Parameter(opacities),
+            # dc and rest of the SH coefficients are separated to apply for different learning rates
+            "sh_coeffs_dc": torch.nn.Parameter(sh_coeffs[:, 0, :]),
+            "sh_coeffs_rest": torch.nn.Parameter(sh_coeffs[:, 1:, :]),
+        }
+    ).to(device)
 
     return learnable_params
 
@@ -75,7 +78,7 @@ def setup_optimizers(
             # scale learning rates by sqrt of batch size
             [{"params": gaussians[name], "lr": lr * math.sqrt(batch_size)}],
             eps=1e-15,
-            betas=(1 - batch_size*(1-0.9), 1 - batch_size*(1-0.999)),
+            betas=(1 - batch_size * (1 - 0.9), 1 - batch_size * (1 - 0.999)),
         )
         for name, lr in lr_dict.items()
     }
@@ -84,7 +87,7 @@ def setup_optimizers(
 
 def train():
     load_cached_input = True
-    data_dir="colmap_data"
+    data_dir = "colmap_data"
     if load_cached_input:
         logging.info("Loading cached input...")
         with open(f"{data_dir}/input_data.pkl", "rb") as f:
@@ -96,22 +99,54 @@ def train():
             pickle.dump((camera_data, points, rgbs), f)
 
     batch_size = 1
+    sh_degree = 3
+    max_steps = 10000
+    sh_degree_increase_step = 1000
+    ssim_lambda = 0.2
+
     train_dataset = Dataset(camera_data, split="train")
-    train_dataloader = torch.utils.data.DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+    train_dataloader = torch.utils.data.DataLoader(
+        train_dataset, batch_size=batch_size, shuffle=True
+    )
     train_dataiter = iter(train_dataloader)
 
     logging.info(f"Initializing {points.shape[0]} gaussians...")
     points = torch.from_numpy(points).float()
     rgbs = torch.from_numpy(rgbs / 255.0).float()  # Normalize RGB values to [0, 1]
-    gaussians = initialize(points, rgbs)
+    gaussians = initialize(points, rgbs, sh_degree=sh_degree)
 
     logging.info("Optimizer setup...")
     optimizers = setup_optimizers(gaussians, batch_size)
+    # exponential decay, lr_at_end = 0.01 * lr_at_start
+    means_scheduler = torch.optim.lr_scheduler.ExponentialLR(
+        optimizers["means"], gamma=0.01 ** (1 / max_steps)
+    )
 
     logging.info("Training started...")
-    max_steps = 100
     for step in tqdm(range(max_steps), desc="Training"):
         data = next(train_dataiter)
+
+        # increase SH degree every 1000 steps, to progressively learn higher frequency details
+        sh_degree_to_use = min(sh_degree, step // sh_degree_increase_step)
+
+        rendered_image = render()
+
+        # L1 loss on pixel colors
+        l1_loss = torch.nn.functional.l1_loss(rendered_image, data["image"])
+        # Dissimilarity SSIM on structural similarity
+        ssim_loss = 1.0 - fused_ssim(
+            rendered_image.permute(0, 3, 1, 2),  # (N, H, W, C) -> (N, C, H, W)
+            data["image"].permute(0, 3, 1, 2),  # NCHW format for pytorch
+            padding="valid",  # no padding to avoid border artifacts
+        )
+
+        loss = (1 - ssim_lambda) * l1_loss + ssim_lambda * ssim_loss
+        loss.backward()
+
+        for optimizer in optimizers.values():
+            optimizer.step()
+            optimizer.zero_grad()
+        means_scheduler.step()
 
 
 if __name__ == "__main__":
