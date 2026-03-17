@@ -206,6 +206,8 @@ def render(
     min_opacity=1 / 255,
     min_radius=0.5,
     max_radius=128.0,
+    alpha_threshold=1e-4,
+    transmitance_threshold=1e-4,
     device="cuda",
 ):
     means = gaussians["means"].to(device)  # (N, 3)
@@ -249,9 +251,11 @@ def render(
     colors = evaluate_spherical_harmonics(sh_coeffs, view_dirs)  # (M, 3)
 
     # project Gaussian to image plane
-    points_cam_clone = points_cam.clone()  # (3, M)
-    points_cam = points_cam_clone / points_cam_clone[2, :]  # perspective divide, (3, M)
-    points_img = (intrinsic @ points_cam)[:2, :].t()  # image plane, (M, 2)
+    x, y, z = points_cam.unbind(0)  # (M,)
+    fx, fy = intrinsic[0, 0], intrinsic[1, 1]
+    cx, cy = intrinsic[0, 2], intrinsic[1, 2]
+    u_img = fx * x / z + cx  # (M,)
+    v_img = fy * y / z + cy  # (M,)
 
     # build Gaussian covariance matrices from scales and orientations
     S = torch.diag_embed(scales)  # (M, 3, 3)
@@ -277,7 +281,8 @@ def render(
     # eigvals = torch.linalg.eigvalsh(cov_img)  # (M, 2)
     # valid_mask = (eigvals > 1e-6).all(dim=1)  # (M,)
     valid_mask = torch.isfinite(cov_img).all(dim=(1, 2))  # (M,), filter out NaN or Inf
-    points_img = points_img[valid_mask]  # (K, 2) where K <= M
+    u_img = u_img[valid_mask]  # (K,) where K <= M
+    v_img = v_img[valid_mask]  # (K,)
     opacities = opacities[valid_mask]  # (K,)
     colors = colors[valid_mask]  # (K, 3)
     z = z[valid_mask]  # (K,)
@@ -287,7 +292,6 @@ def render(
     extend = 3  # extend up to 3 standard deviations to account for the Gaussian tails
     radius_u = torch.sqrt(cov_img[:, 0, 0].clamp_min(1e-12)) * extend  # (K,)
     radius_v = torch.sqrt(cov_img[:, 1, 1].clamp_min(1e-12)) * extend  # (K,)
-    u_img, v_img = points_img.unbind(1)  # (K,)
     radius = torch.maximum(radius_u, radius_v)
     cull_mask = (
         torch.isfinite(radius_u)
@@ -303,7 +307,8 @@ def render(
         & (v_img < height + radius_v)
     )
     within_image_mask = within_image_mask & cull_mask
-    points_img = points_img[within_image_mask]  # (L, 2) where L <= K
+    u_img = u_img[within_image_mask]  # (L,) where L <= K
+    v_img = v_img[within_image_mask]  # (L,)
     opacities = opacities[within_image_mask]  # (L,)
     colors = colors[within_image_mask]  # (L, 3)
     z = z[within_image_mask]  # (L,)
@@ -311,16 +316,16 @@ def render(
 
     # global sorting by depth for correct compositing order (near to far)
     order = torch.argsort(z, descending=False)
-    points_img = points_img[order]
+    u_img = u_img[order]
+    v_img = v_img[order]
     opacities = opacities[order]
     colors = colors[order]
     cov_img = cov_img[order]
 
     # tiling
-    T = 64  # 16x16 pixel tiles
+    T = 256  # 16x16 pixel tiles
     radius_u = torch.sqrt(cov_img[:, 0, 0]) * extend  # (L,)
     radius_v = torch.sqrt(cov_img[:, 1, 1]) * extend  # (L,)
-    u_img, v_img = points_img.unbind(1)  # (L,)
 
     # AABB of the Gaussian in image space
     u_min = torch.floor(u_img - radius_u).clamp(min=0, max=width - 1).long()
@@ -348,7 +353,9 @@ def render(
             if not in_tile_mask.any():
                 continue
 
-            gs_points = points_img[in_tile_mask]  # (G, 2) where G <= L
+            gs_points = torch.stack(
+                [u_img[in_tile_mask], v_img[in_tile_mask]], dim=1
+            )  # (G, 2) where G <= L
             gs_colors = colors[in_tile_mask]  # (G, 3)
             gs_opacities = opacities[in_tile_mask]  # (G,)
             gs_covs = cov_img[in_tile_mask]  # (G, 2, 2)
@@ -377,7 +384,7 @@ def render(
                 gs_points.dtype
             )  # (tile_w, tile_h, 2)
 
-            transmittance = torch.ones((tile_h, tile_w), device=means.device, dtype=gs_points.dtype)
+            transmitance = torch.ones((tile_h, tile_w), device=means.device, dtype=gs_points.dtype)
             contribution = torch.zeros(
                 (tile_h, tile_w, 3), device=means.device, dtype=gs_points.dtype
             )
@@ -396,10 +403,16 @@ def render(
                         "...i,ij,...j->...", diff, chunk_covs_inv[idx], diff
                     )  # (tile_h, tile_w)
                     alpha = torch.exp(-0.5 * exponent) * chunk_opacities[idx]  # (tile_h, tile_w)
-                    contribution += (transmittance * alpha).unsqueeze(-1) * chunk_colors[idx].view(
+                    alpha = torch.where(alpha < alpha_threshold, torch.zeros_like(alpha), alpha)
+                    contribution += (transmitance * alpha).unsqueeze(-1) * chunk_colors[idx].view(
                         1, 1, 3
                     )  # (tile_h, tile_w, 3)
-                    transmittance *= 1 - alpha + 1e-10
+                    transmitance *= 1 - alpha + 1e-10
+                    transmitance = torch.where(
+                        transmitance < transmitance_threshold,
+                        torch.zeros_like(transmitance),
+                        transmitance,
+                    )
 
             rendered_image[v0:v1, u0:u1, :] = contribution
 
