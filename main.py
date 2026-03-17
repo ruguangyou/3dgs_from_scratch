@@ -1,6 +1,7 @@
 import logging
 import math
 import pickle
+import cv2
 import numpy as np
 import torch
 from fused_ssim import fused_ssim
@@ -85,6 +86,250 @@ def setup_optimizers(
     return optimizers
 
 
+def quaternion_to_rotation_matrix(quaternions):
+    # quaternions shape: (N, 4) in (x, y, z, w) format
+    x, y, z, w = quaternions.unbind(dim=1)
+
+    R = torch.zeros((quaternions.shape[0], 3, 3), device=quaternions.device)
+    R[:, 0, 0] = 1 - 2 * (y**2 + z**2)
+    R[:, 0, 1] = 2 * (x * y - z * w)
+    R[:, 0, 2] = 2 * (x * z + y * w)
+    R[:, 1, 0] = 2 * (x * y + z * w)
+    R[:, 1, 1] = 1 - 2 * (x**2 + z**2)
+    R[:, 1, 2] = 2 * (y * z - x * w)
+    R[:, 2, 0] = 2 * (x * z - y * w)
+    R[:, 2, 1] = 2 * (y * z + x * w)
+    R[:, 2, 2] = 1 - 2 * (x**2 + y**2)
+
+    return R
+
+
+def evaluate_spherical_harmonics(sh_coeffs, view_dirs):
+    # sh_coeffs shape: (N, 16, 3) for degree 3
+    # view_dirs shape: (N, 3)
+
+    SH_C0 = 0.28209479177387814
+    SH_C1_x = 0.4886025119029199
+    SH_C1_y = 0.4886025119029199
+    SH_C1_z = 0.4886025119029199
+    SH_C2_xy = 1.0925484305920792
+    SH_C2_xz = 1.0925484305920792
+    SH_C2_yz = 1.0925484305920792
+    SH_C2_zz = 0.31539156525252005
+    SH_C2_xx_yy = 0.5462742152960396
+    SH_C3_yxx_yyy = 0.5900435899266435
+    SH_C3_xyz = 2.890611442640554
+    SH_C3_yzz_yxx_yyy = 0.4570457994644658
+    SH_C3_zzz_zxx_zyy = 0.3731763325901154
+    SH_C3_xzz_xxx_xyy = 0.4570457994644658
+    SH_C3_zxx_zyy = 1.445305721320277
+    SH_C3_xxx_xyy = 0.5900435899266435
+
+    x, y, z = view_dirs.unbind(dim=1)  # (N,)
+    xx, yy, zz = x * x, y * y, z * z
+    xy, xz, yz = x * y, x * z, y * z
+
+    sh_basis = torch.stack(
+        [
+            torch.full_like(x, SH_C0),  # l=0, m=0
+            -SH_C1_y * y,  # l=1, m=-1
+            SH_C1_z * z,  # l=1, m=0
+            -SH_C1_x * x,  # l=1, m=1
+            SH_C2_xy * xy,  # l=2, m=-2
+            SH_C2_yz * yz,  # l=2, m=-1
+            SH_C2_zz * (3 * zz - 1),  # l=2, m=0
+            SH_C2_xz * xz,  # l=2, m=1
+            SH_C2_xx_yy * (xx - yy),  # l=2, m=2
+            SH_C3_yxx_yyy * y * (xx - yy),  # l=3, m=-3
+            SH_C3_xyz * (x * y * z),  # l=3, m=-2
+            SH_C3_yzz_yxx_yyy * y * (4 * zz - xx - yy),  # l=3, m=-1
+            SH_C3_zzz_zxx_zyy * z * (2 * zz - 3 * xx - 3 * yy),  # l=3, m=0
+            SH_C3_xzz_xxx_xyy * x * (4 * zz - xx - yy),  # l=3, m=1
+            SH_C3_zxx_zyy * z * (xx - yy),  # l=3, m=2
+            SH_C3_xxx_xyy * x * (xx - 3 * yy),  # l=3, m=3
+        ],
+        dim=1,
+    )  # (N, 16)
+
+    return torch.sigmoid((sh_coeffs * sh_basis.unsqueeze(-1)).sum(dim=1))  # (N, 3)
+
+
+def render(gaussians, camera, near_plane=0.01, far_plane=100.0, device="cuda"):
+    means = gaussians["means"].to(device)  # (N, 3)
+    scales = torch.exp(gaussians["scales"]).to(device)  # (N, 3), ensure positivity
+    quaternions = gaussians["quaternions"].to(device)  # (N, 4), normalize to unit length
+    quaternions = quaternions / torch.norm(quaternions, dim=1, keepdim=True)
+    opacities = torch.sigmoid(gaussians["opacities"]).to(device)  # (N,), constrain to (0, 1)
+    sh_coeffs = torch.cat(
+        [
+            gaussians["sh_coeffs_dc"].unsqueeze(1),  # (N, 3) -> (N, 1, 3)
+            gaussians["sh_coeffs_rest"],  # (N, 15, 3) for degree 3
+        ],
+        dim=1,
+    ).to(device)  # (N, 16, 3)
+
+    # batch size is 1
+    world_to_camera = camera["world_to_camera"].squeeze(0).to(device)  # (1, 4, 4) -> (4, 4)
+    intrinsic = camera["intrinsic"].squeeze(0).to(device)  # (1, 3, 3) -> (3, 3)
+    height, width = camera["image"].shape[1:3]  # (1, H, W, C)
+    N = means.shape[0]
+
+    # transform Gaussian centers to camera space
+    points_cam = (
+        world_to_camera @ torch.cat([means, torch.ones(N, 1).to(means.device)], dim=1).t()
+    )[:3, :]  # camera space, (3, N)
+
+    # filter out Gaussians that are behind the near plane or beyond the far plane
+    depth = points_cam[2, :]  # (N,)
+    valid_depth_mask = (depth > near_plane) & (depth < far_plane)
+    points_cam = points_cam[:, valid_depth_mask]  # (3, M) where M <= N
+    scales = scales[valid_depth_mask]  # (M, 3)
+    quaternions = quaternions[valid_depth_mask]  # (M, 4)
+    opacities = opacities[valid_depth_mask]  # (M,)
+    sh_coeffs = sh_coeffs[valid_depth_mask]  # (M, 16, 3)
+    M = points_cam.shape[1]
+
+    # evaluate spherical harmonics at the view direction
+    camera_pos = -world_to_camera[:3, :3].t() @ world_to_camera[:3, 3]  # (3,)
+    view_dirs = means[valid_depth_mask] - camera_pos.unsqueeze(0)  # (M, 3)
+    view_dirs = view_dirs / torch.norm(view_dirs, dim=1, keepdim=True)
+    colors = evaluate_spherical_harmonics(sh_coeffs, view_dirs)  # (M, 3)
+
+    # project Gaussian to image plane
+    points_cam_clone = points_cam.clone()  # (3, M)
+    points_cam = points_cam_clone / points_cam_clone[2, :]  # perspective divide, (3, M)
+    points_img = (intrinsic @ points_cam)[:2, :].t()  # image plane, (M, 2)
+
+    # build Gaussian covariance matrices from scales and orientations
+    S = torch.diag_embed(scales)  # (M, 3, 3)
+    R = quaternion_to_rotation_matrix(quaternions)  # (M, 3, 3)
+    cov_world = R @ S @ S @ R.transpose(1, 2)  # (M, 3, 3)
+    R_world_to_camera = world_to_camera[:3, :3]  # (3, 3)
+    cov_cam = R_world_to_camera.unsqueeze(0) @ cov_world @ R_world_to_camera.t().unsqueeze(0)
+
+    # project Gaussian covariances to image plane
+    J = torch.zeros((M, 2, 3), device=means.device)  # Jacobian of projection
+    fx, fy = intrinsic[0, 0], intrinsic[1, 1]
+    x, y, z = points_cam.unbind(0)  # (M,)
+    invz = 1 / z
+    invz2 = invz * invz
+    J[:, 0, 0] = fx * invz
+    J[:, 1, 1] = fy * invz
+    J[:, 0, 2] = -fx * x * invz2
+    J[:, 1, 2] = -fy * y * invz2
+    cov_img = J @ cov_cam @ J.transpose(1, 2)  # (M, 2, 2)
+
+    # valid mask for Gaussians that have positive definite covariances
+    cov_img = (cov_img + cov_img.transpose(1, 2)) / 2  # ensure symmetry
+    # eigvals = torch.linalg.eigvalsh(cov_img)  # (M, 2)
+    # valid_mask = (eigvals > 1e-6).all(dim=1)  # (M,)
+    valid_mask = torch.isfinite(cov_img).all(dim=(1, 2))  # (M,), filter out NaN or Inf
+    points_img = points_img[valid_mask]  # (K, 2) where K <= M
+    opacities = opacities[valid_mask]  # (K,)
+    colors = colors[valid_mask]  # (K, 3)
+    z = z[valid_mask]  # (K,)
+    cov_img = cov_img[valid_mask]  # (K, 2, 2)
+
+    # valid mask for Gaussians that project within the image boundaries
+    extend = 3  # extend up to 3 standard deviations to account for the Gaussian tails
+    radius_x = torch.sqrt(cov_img[:, 0, 0]) * extend  # (K,)
+    radius_y = torch.sqrt(cov_img[:, 1, 1]) * extend  # (K,)
+    x_img, y_img = points_img.unbind(1)  # (K,)
+    within_image_mask = (
+        (x_img > -radius_x)
+        & (x_img < width + radius_x)
+        & (y_img > -radius_y)
+        & (y_img < height + radius_y)
+    )
+    points_img = points_img[within_image_mask]  # (L, 2) where L <= K
+    opacities = opacities[within_image_mask]  # (L,)
+    colors = colors[within_image_mask]  # (L, 3)
+    z = z[within_image_mask]  # (L,)
+    cov_img = cov_img[within_image_mask]  # (L, 2, 2)
+
+    # global sorting by depth for correct compositing order (near to far)
+    order = torch.argsort(z, descending=False)
+    points_img = points_img[order]
+    opacities = opacities[order]
+    colors = colors[order]
+    cov_img = cov_img[order]
+
+    # tiling
+    T = 16  # 16x16 pixel tiles
+    radius_x = torch.sqrt(cov_img[:, 0, 0]) * extend  # (L,)
+    radius_y = torch.sqrt(cov_img[:, 1, 1]) * extend  # (L,)
+    x_img, y_img = points_img.unbind(1)  # (L,)
+
+    # AABB of the Gaussian in image space
+    x_min = torch.floor(x_img - radius_x).clamp(min=0, max=width - 1).long()
+    x_max = torch.floor(x_img + radius_x).clamp(min=0, max=width - 1).long()
+    y_min = torch.floor(y_img - radius_y).clamp(min=0, max=height - 1).long()
+    y_max = torch.floor(y_img + radius_y).clamp(min=0, max=height - 1).long()
+
+    # tile indices covered by the AABB
+    tile_x_min = torch.floor(x_min / T).long()
+    tile_x_max = torch.floor(x_max / T).long()
+    tile_y_min = torch.floor(y_min / T).long()
+    tile_y_max = torch.floor(y_max / T).long()
+
+    # for each tile, find the Gaussians that overlap with it and composite them
+    rendered_image = torch.zeros((height, width, 3), device=means.device)  # (H, W, C)
+    for tile_x in range((width - 1) // T + 1):
+        for tile_y in range((height - 1) // T + 1):
+            in_tile_mask = (
+                (tile_x_min <= tile_x)
+                & (tile_x_max >= tile_x)
+                & (tile_y_min <= tile_y)
+                & (tile_y_max >= tile_y)
+            )  # (L,)
+            if not in_tile_mask.any():
+                continue
+
+            gs_points = points_img[in_tile_mask]  # (G, 2) where G <= L
+            gs_colors = colors[in_tile_mask]  # (G, 3)
+            gs_opacities = opacities[in_tile_mask]  # (G,)
+            gs_covs = cov_img[in_tile_mask]  # (G, 2, 2)
+            gs_covs_inv = torch.linalg.inv(gs_covs)  # (G, 2, 2)
+
+            x0, x1 = tile_x * T, min((tile_x + 1) * T, width)
+            y0, y1 = tile_y * T, min((tile_y + 1) * T, height)
+            pixel_x = torch.arange(x0, x1, device=means.device)
+            pixel_y = torch.arange(y0, y1, device=means.device)
+            pixel_xx, pixel_yy = torch.meshgrid(pixel_x, pixel_y)  # (T, T)
+            pixel_coords = torch.stack([pixel_xx, pixel_yy], dim=-1)  # (T, T, 2)
+
+            # alpha blending
+            diff = (
+                pixel_coords.unsqueeze(2)  # (T, T, 1, 2)
+                - gs_points.unsqueeze(0).unsqueeze(0)  # (1, 1, G, 2)
+            ).unsqueeze(-1)  # (T, T, G, 2, 1)
+            exponent = (
+                (
+                    diff.transpose(-2, -1)  # (T, T, G, 1, 2)
+                    @ gs_covs_inv.unsqueeze(0).unsqueeze(0)  # (1, 1, G, 2, 2)
+                    @ diff  # (T, T, G, 2, 1)
+                )
+                .squeeze(-1)
+                .squeeze(-1)
+            )  # (T, T, G, 1, 1) -> (T, T, G)
+            alpha = (
+                torch.exp(-0.5 * exponent)  # (T, T, G)
+                * gs_opacities.unsqueeze(0).unsqueeze(0)  # (1, 1, G)
+            )  # (T, T, G)
+            one_minus_alpha = 1 - alpha  # (T, T, G)
+            transmittance = torch.cumprod(
+                one_minus_alpha + 1e-10, dim=2
+            )  # (T, T, G), cumulative product along the Gaussian dimension
+            contribution = (
+                (transmittance * alpha).unsqueeze(-1)  # (T, T, G)
+                * gs_colors.unsqueeze(0).unsqueeze(0)  # (1, 1, G, 3)
+            ).sum(dim=2)  # (T, T, 3)
+
+            rendered_image[y0:y1, x0:x1, :] = contribution
+
+    return rendered_image
+
+
 def train():
     load_cached_input = True
     data_dir = "colmap_data"
@@ -124,24 +369,30 @@ def train():
 
     logging.info("Training started...")
     for step in tqdm(range(max_steps), desc="Training"):
-        data = next(train_dataiter)
+        camera = next(train_dataiter)
 
-        # increase SH degree every 1000 steps, to progressively learn higher frequency details
-        sh_degree_to_use = min(sh_degree, step // sh_degree_increase_step)
-
-        rendered_image = render()
+        rendered_image = render(gaussians, camera)
+        cv2.imshow("Rendered Image", rendered_image.cpu().numpy())
+        cv2.imshow("Target Image", camera["image"].cpu().numpy())
+        cv2.waitKey(0)
 
         # L1 loss on pixel colors
-        l1_loss = torch.nn.functional.l1_loss(rendered_image, data["image"])
+        l1_loss = torch.nn.functional.l1_loss(rendered_image, camera["image"])
         # Dissimilarity SSIM on structural similarity
         ssim_loss = 1.0 - fused_ssim(
             rendered_image.permute(0, 3, 1, 2),  # (N, H, W, C) -> (N, C, H, W)
-            data["image"].permute(0, 3, 1, 2),  # NCHW format for pytorch
+            camera["image"].permute(0, 3, 1, 2),  # NCHW format for pytorch
             padding="valid",  # no padding to avoid border artifacts
         )
 
         loss = (1 - ssim_lambda) * l1_loss + ssim_lambda * ssim_loss
         loss.backward()
+
+        # increase SH degree every 1000 steps, to progressively learn higher frequency details
+        sh_degree_to_use = min(sh_degree, step // sh_degree_increase_step)
+        # zero out gradients for unused SH coefficients
+        if sh_degree_to_use < sh_degree:
+            gaussians["sh_coeffs_rest"].grad[:, (sh_degree_to_use + 1) ** 2 - 1 :, :].zero_()
 
         for optimizer in optimizers.values():
             optimizer.step()
