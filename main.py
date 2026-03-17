@@ -4,6 +4,7 @@ import pickle
 import cv2
 import numpy as np
 import torch
+import torch.nn.functional as F
 from fused_ssim import fused_ssim
 from tqdm import tqdm
 from sklearn.neighbors import NearestNeighbors
@@ -154,7 +155,59 @@ def evaluate_spherical_harmonics(sh_coeffs, view_dirs):
     return torch.sigmoid((sh_coeffs * sh_basis.unsqueeze(-1)).sum(dim=1))  # (N, 3)
 
 
-def render(gaussians, camera, near_plane=0.01, far_plane=100.0, device="cuda"):
+def downsample_point_cloud(
+    points: np.ndarray,
+    rgbs: np.ndarray,
+    max_points: int,
+    seed: int = 42,
+):
+    if max_points <= 0 or points.shape[0] <= max_points:
+        return points, rgbs
+
+    rng = np.random.default_rng(seed)
+    keep_idx = rng.choice(points.shape[0], size=max_points, replace=False)
+    return points[keep_idx], rgbs[keep_idx]
+
+
+def resize_camera(camera, image_scale: float):
+    if image_scale == 1.0:
+        return camera
+
+    image = camera["image"]
+    world_to_camera = camera["world_to_camera"]
+    intrinsic = camera["intrinsic"].clone()
+
+    resized_image = F.interpolate(
+        image.permute(0, 3, 1, 2),
+        scale_factor=image_scale,
+        mode="bilinear",
+        align_corners=False,
+        recompute_scale_factor=False,
+    ).permute(0, 2, 3, 1)
+
+    intrinsic[:, 0, 0] *= image_scale
+    intrinsic[:, 1, 1] *= image_scale
+    intrinsic[:, 0, 2] *= image_scale
+    intrinsic[:, 1, 2] *= image_scale
+
+    return {
+        "world_to_camera": world_to_camera,
+        "intrinsic": intrinsic,
+        "image": resized_image,
+        "camera_id": camera["camera_id"],
+    }
+
+
+def render(
+    gaussians,
+    camera,
+    near_plane=0.01,
+    far_plane=100.0,
+    min_opacity=1 / 255,
+    min_radius=0.5,
+    max_radius=128.0,
+    device="cuda",
+):
     means = gaussians["means"].to(device)  # (N, 3)
     scales = torch.exp(gaussians["scales"]).to(device)  # (N, 3), ensure positivity
     quaternions = gaussians["quaternions"].to(device)  # (N, 4), normalize to unit length
@@ -232,15 +285,24 @@ def render(gaussians, camera, near_plane=0.01, far_plane=100.0, device="cuda"):
 
     # valid mask for Gaussians that project within the image boundaries
     extend = 3  # extend up to 3 standard deviations to account for the Gaussian tails
-    radius_u = torch.sqrt(cov_img[:, 0, 0]) * extend  # (K,)
-    radius_v = torch.sqrt(cov_img[:, 1, 1]) * extend  # (K,)
+    radius_u = torch.sqrt(cov_img[:, 0, 0].clamp_min(1e-12)) * extend  # (K,)
+    radius_v = torch.sqrt(cov_img[:, 1, 1].clamp_min(1e-12)) * extend  # (K,)
     u_img, v_img = points_img.unbind(1)  # (K,)
+    radius = torch.maximum(radius_u, radius_v)
+    cull_mask = (
+        torch.isfinite(radius_u)
+        & torch.isfinite(radius_v)
+        & (opacities >= min_opacity)
+        & (radius >= min_radius)
+        & (radius <= max_radius)
+    )
     within_image_mask = (
         (u_img > -radius_u)
         & (u_img < width + radius_u)
         & (v_img > -radius_v)
         & (v_img < height + radius_v)
     )
+    within_image_mask = within_image_mask & cull_mask
     points_img = points_img[within_image_mask]  # (L, 2) where L <= K
     opacities = opacities[within_image_mask]  # (L,)
     colors = colors[within_image_mask]  # (L, 3)
@@ -255,7 +317,7 @@ def render(gaussians, camera, near_plane=0.01, far_plane=100.0, device="cuda"):
     cov_img = cov_img[order]
 
     # tiling
-    T = 16  # 16x16 pixel tiles
+    T = 64  # 16x16 pixel tiles
     radius_u = torch.sqrt(cov_img[:, 0, 0]) * extend  # (L,)
     radius_v = torch.sqrt(cov_img[:, 1, 1]) * extend  # (L,)
     u_img, v_img = points_img.unbind(1)  # (L,)
@@ -341,7 +403,7 @@ def render(gaussians, camera, near_plane=0.01, far_plane=100.0, device="cuda"):
 
             rendered_image[v0:v1, u0:u1, :] = contribution
 
-    return rendered_image
+    return rendered_image * 255
 
 
 def train():
@@ -362,6 +424,16 @@ def train():
     max_steps = 10000
     sh_degree_increase_step = 1000
     ssim_lambda = 0.2
+    initial_max_points = 10000
+    initial_downsample_seed = 42
+    image_scale = 0.5
+
+    points, rgbs = downsample_point_cloud(
+        points,
+        rgbs,
+        max_points=initial_max_points,
+        seed=initial_downsample_seed,
+    )
 
     train_dataset = Dataset(camera_data, split="train")
     train_dataloader = torch.utils.data.DataLoader(
@@ -383,7 +455,7 @@ def train():
 
     logging.info("Training started...")
     for step in tqdm(range(max_steps), desc="Training"):
-        camera = next(train_dataiter)
+        camera = resize_camera(next(train_dataiter), image_scale=image_scale)
 
         rendered_image = render(gaussians, camera)
         cv2.imshow("Rendered Image", rendered_image.cpu().numpy())
