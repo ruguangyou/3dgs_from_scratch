@@ -440,6 +440,7 @@ def train():
     initial_max_points = 10000
     initial_downsample_seed = 42
     image_scale = 0.5
+    debug = True
 
     points, rgbs = downsample_point_cloud(
         points,
@@ -471,9 +472,11 @@ def train():
         camera = resize_camera(next(train_dataiter), image_scale=image_scale)
 
         rendered_image = render(gaussians, camera)
-        cv2.imshow("Rendered Image", rendered_image.cpu().numpy())
-        cv2.imshow("Target Image", camera["image"].cpu().numpy())
-        cv2.waitKey(0)
+
+        if debug and step % 100 == 0:
+            cv2.imshow("Rendered Image", rendered_image.cpu().numpy())
+            cv2.imshow("Target Image", camera["image"].cpu().numpy())
+            cv2.waitKey(1)
 
         # L1 loss on pixel colors
         l1_loss = torch.nn.functional.l1_loss(rendered_image, camera["image"])
