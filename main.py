@@ -232,14 +232,14 @@ def render(gaussians, camera, near_plane=0.01, far_plane=100.0, device="cuda"):
 
     # valid mask for Gaussians that project within the image boundaries
     extend = 3  # extend up to 3 standard deviations to account for the Gaussian tails
-    radius_x = torch.sqrt(cov_img[:, 0, 0]) * extend  # (K,)
-    radius_y = torch.sqrt(cov_img[:, 1, 1]) * extend  # (K,)
-    x_img, y_img = points_img.unbind(1)  # (K,)
+    radius_u = torch.sqrt(cov_img[:, 0, 0]) * extend  # (K,)
+    radius_v = torch.sqrt(cov_img[:, 1, 1]) * extend  # (K,)
+    u_img, v_img = points_img.unbind(1)  # (K,)
     within_image_mask = (
-        (x_img > -radius_x)
-        & (x_img < width + radius_x)
-        & (y_img > -radius_y)
-        & (y_img < height + radius_y)
+        (u_img > -radius_u)
+        & (u_img < width + radius_u)
+        & (v_img > -radius_v)
+        & (v_img < height + radius_v)
     )
     points_img = points_img[within_image_mask]  # (L, 2) where L <= K
     opacities = opacities[within_image_mask]  # (L,)
@@ -256,31 +256,32 @@ def render(gaussians, camera, near_plane=0.01, far_plane=100.0, device="cuda"):
 
     # tiling
     T = 16  # 16x16 pixel tiles
-    radius_x = torch.sqrt(cov_img[:, 0, 0]) * extend  # (L,)
-    radius_y = torch.sqrt(cov_img[:, 1, 1]) * extend  # (L,)
-    x_img, y_img = points_img.unbind(1)  # (L,)
+    radius_u = torch.sqrt(cov_img[:, 0, 0]) * extend  # (L,)
+    radius_v = torch.sqrt(cov_img[:, 1, 1]) * extend  # (L,)
+    u_img, v_img = points_img.unbind(1)  # (L,)
 
     # AABB of the Gaussian in image space
-    x_min = torch.floor(x_img - radius_x).clamp(min=0, max=width - 1).long()
-    x_max = torch.floor(x_img + radius_x).clamp(min=0, max=width - 1).long()
-    y_min = torch.floor(y_img - radius_y).clamp(min=0, max=height - 1).long()
-    y_max = torch.floor(y_img + radius_y).clamp(min=0, max=height - 1).long()
+    u_min = torch.floor(u_img - radius_u).clamp(min=0, max=width - 1).long()
+    u_max = torch.floor(u_img + radius_u).clamp(min=0, max=width - 1).long()
+    v_min = torch.floor(v_img - radius_v).clamp(min=0, max=height - 1).long()
+    v_max = torch.floor(v_img + radius_v).clamp(min=0, max=height - 1).long()
 
     # tile indices covered by the AABB
-    tile_x_min = torch.floor(x_min / T).long()
-    tile_x_max = torch.floor(x_max / T).long()
-    tile_y_min = torch.floor(y_min / T).long()
-    tile_y_max = torch.floor(y_max / T).long()
+    tile_u_min = torch.floor(u_min / T).long()
+    tile_u_max = torch.floor(u_max / T).long()
+    tile_v_min = torch.floor(v_min / T).long()
+    tile_v_max = torch.floor(v_max / T).long()
 
     # for each tile, find the Gaussians that overlap with it and composite them
+    gaussian_chunk_size = 64
     rendered_image = torch.zeros((height, width, 3), device=means.device)  # (H, W, C)
-    for tile_x in range((width - 1) // T + 1):
-        for tile_y in range((height - 1) // T + 1):
+    for tile_u in range((width - 1) // T + 1):
+        for tile_v in range((height - 1) // T + 1):
             in_tile_mask = (
-                (tile_x_min <= tile_x)
-                & (tile_x_max >= tile_x)
-                & (tile_y_min <= tile_y)
-                & (tile_y_max >= tile_y)
+                (tile_u_min <= tile_u)
+                & (tile_u_max >= tile_u)
+                & (tile_v_min <= tile_v)
+                & (tile_v_max >= tile_v)
             )  # (L,)
             if not in_tile_mask.any():
                 continue
@@ -289,43 +290,56 @@ def render(gaussians, camera, near_plane=0.01, far_plane=100.0, device="cuda"):
             gs_colors = colors[in_tile_mask]  # (G, 3)
             gs_opacities = opacities[in_tile_mask]  # (G,)
             gs_covs = cov_img[in_tile_mask]  # (G, 2, 2)
-            gs_covs_inv = torch.linalg.inv(gs_covs)  # (G, 2, 2)
+            a = gs_covs[:, 0, 0]
+            b = gs_covs[:, 0, 1]
+            c = gs_covs[:, 1, 0]
+            d = gs_covs[:, 1, 1]
+            det = a * d - b * c
+            inv_det = 1.0 / det.clamp_min(1e-12)
+            gs_covs_inv = torch.stack(
+                [
+                    torch.stack([d * inv_det, -b * inv_det], dim=-1),
+                    torch.stack([-c * inv_det, a * inv_det], dim=-1),
+                ],
+                dim=1,
+            )  # (G, 2, 2)
 
-            x0, x1 = tile_x * T, min((tile_x + 1) * T, width)
-            y0, y1 = tile_y * T, min((tile_y + 1) * T, height)
-            pixel_x = torch.arange(x0, x1, device=means.device)
-            pixel_y = torch.arange(y0, y1, device=means.device)
-            pixel_xx, pixel_yy = torch.meshgrid(pixel_x, pixel_y)  # (T, T)
-            pixel_coords = torch.stack([pixel_xx, pixel_yy], dim=-1)  # (T, T, 2)
+            u0, u1 = tile_u * T, min((tile_u + 1) * T, width)
+            v0, v1 = tile_v * T, min((tile_v + 1) * T, height)
+            tile_h = v1 - v0
+            tile_w = u1 - u0
+            pixel_u = torch.arange(u0, u1, device=means.device)  # (tile_w,)
+            pixel_v = torch.arange(v0, v1, device=means.device)  # (tile_h,)
+            pixel_uu, pixel_vv = torch.meshgrid(pixel_u, pixel_v, indexing="xy")  # (tile_w, tile_h)
+            pixel_coords = torch.stack([pixel_uu, pixel_vv], dim=-1).to(
+                gs_points.dtype
+            )  # (tile_w, tile_h, 2)
 
-            # alpha blending
-            diff = (
-                pixel_coords.unsqueeze(2)  # (T, T, 1, 2)
-                - gs_points.unsqueeze(0).unsqueeze(0)  # (1, 1, G, 2)
-            ).unsqueeze(-1)  # (T, T, G, 2, 1)
-            exponent = (
-                (
-                    diff.transpose(-2, -1)  # (T, T, G, 1, 2)
-                    @ gs_covs_inv.unsqueeze(0).unsqueeze(0)  # (1, 1, G, 2, 2)
-                    @ diff  # (T, T, G, 2, 1)
-                )
-                .squeeze(-1)
-                .squeeze(-1)
-            )  # (T, T, G, 1, 1) -> (T, T, G)
-            alpha = (
-                torch.exp(-0.5 * exponent)  # (T, T, G)
-                * gs_opacities.unsqueeze(0).unsqueeze(0)  # (1, 1, G)
-            )  # (T, T, G)
-            one_minus_alpha = 1 - alpha  # (T, T, G)
-            transmittance = torch.cumprod(
-                one_minus_alpha + 1e-10, dim=2
-            )  # (T, T, G), cumulative product along the Gaussian dimension
-            contribution = (
-                (transmittance * alpha).unsqueeze(-1)  # (T, T, G)
-                * gs_colors.unsqueeze(0).unsqueeze(0)  # (1, 1, G, 3)
-            ).sum(dim=2)  # (T, T, 3)
+            transmittance = torch.ones((tile_h, tile_w), device=means.device, dtype=gs_points.dtype)
+            contribution = torch.zeros(
+                (tile_h, tile_w, 3), device=means.device, dtype=gs_points.dtype
+            )
 
-            rendered_image[y0:y1, x0:x1, :] = contribution
+            G = gs_points.shape[0]
+            for chunk_start in range(0, G, gaussian_chunk_size):
+                chunk_end = min(chunk_start + gaussian_chunk_size, G)
+                chunk_points = gs_points[chunk_start:chunk_end]  # (C, 2)
+                chunk_colors = gs_colors[chunk_start:chunk_end]  # (C, 3)
+                chunk_opacities = gs_opacities[chunk_start:chunk_end]  # (C,)
+                chunk_covs_inv = gs_covs_inv[chunk_start:chunk_end]  # (C, 2, 2)
+
+                for idx in range(chunk_points.shape[0]):
+                    diff = pixel_coords - chunk_points[idx].view(1, 1, 2)  # (tile_h, tile_w, 2)
+                    exponent = torch.einsum(
+                        "...i,ij,...j->...", diff, chunk_covs_inv[idx], diff
+                    )  # (tile_h, tile_w)
+                    alpha = torch.exp(-0.5 * exponent) * chunk_opacities[idx]  # (tile_h, tile_w)
+                    contribution += (transmittance * alpha).unsqueeze(-1) * chunk_colors[idx].view(
+                        1, 1, 3
+                    )  # (tile_h, tile_w, 3)
+                    transmittance *= 1 - alpha + 1e-10
+
+            rendered_image[v0:v1, u0:u1, :] = contribution
 
     return rendered_image
 
