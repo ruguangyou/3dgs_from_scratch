@@ -219,7 +219,8 @@ def render(
     min_radius=0.5,
     max_radius=128.0,
     alpha_threshold=1e-4,
-    transmitance_threshold=1e-4,
+    transmittance_threshold=1e-4,
+    chi_squared_threshold=9.21,  # 99% confidence interval for 2 DOF
     device="cuda",
 ):
     means = means.to(device)  # (N, 3)
@@ -320,6 +321,7 @@ def render(
     colors = colors[within_image_mask]  # (L, 3)
     z = z[within_image_mask]  # (L,)
     cov_img = cov_img[within_image_mask]  # (L, 2, 2)
+    L = u_img.shape[0]
 
     # global sorting by depth for correct compositing order (near to far)
     order = torch.argsort(z, descending=False)
@@ -341,89 +343,127 @@ def render(
     v_max = torch.floor(v_img + radius_v).clamp(min=0, max=height - 1).long()
 
     # tile indices covered by the AABB
-    tile_u_min = torch.floor(u_min / T).long()
-    tile_u_max = torch.floor(u_max / T).long()
-    tile_v_min = torch.floor(v_min / T).long()
-    tile_v_max = torch.floor(v_max / T).long()
+    tile_u_min = torch.floor(u_min / T).long()  # (L,)
+    tile_u_max = torch.floor(u_max / T).long()  # (L,)
+    tile_v_min = torch.floor(v_min / T).long()  # (L,)
+    tile_v_max = torch.floor(v_max / T).long()  # (L,)
 
-    # for each tile, find the Gaussians that overlap with it and composite them
-    gaussian_chunk_size = 64
+    # number of tiles covered by each Gaussian
+    num_tiles_u = tile_u_max - tile_u_min + 1  # (L,)
+    num_tiles_v = tile_v_max - tile_v_min + 1  # (L,)
+
+    # each Gaussian id will be repeated for the number of tiles it covers
+    gaussian_ids = torch.repeat_interleave(
+        torch.arange(L, device=means.device, dtype=torch.int64),
+        num_tiles_u * num_tiles_v,
+    )  # (sum(num_tiles_u * num_tiles_v),)
+
+    # max number of tiles covered by any Gaussian, used for preallocating buffers
+    max_num_tiles_u = num_tiles_u.max().item()
+    max_num_tiles_v = num_tiles_v.max().item()
+
+    # generate tile indices for each Gaussian
+    span_indices_u = torch.arange(max_num_tiles_u, device=means.device)  # (max_num_tiles_u,)
+    span_indices_v = torch.arange(max_num_tiles_v, device=means.device)  # (max_num_tiles_v,)
+    tile_u = (
+        tile_u_min.view(-1, 1, 1) + span_indices_u.view(1, -1, 1)  # (L, max_num_tiles_u, 1)
+    ).expand(L, max_num_tiles_u, max_num_tiles_v)  # (L, max_num_tiles_u, max_num_tiles_v)
+    tile_v = (
+        tile_v_min.view(-1, 1, 1) + span_indices_v.view(1, 1, -1)  # (L, 1, max_num_tiles_v)
+    ).expand(L, max_num_tiles_u, max_num_tiles_v)  # (L, max_num_tiles_u, max_num_tiles_v)
+
+    # mask for valid tiles that are actually covered (some entries are just padding)
+    mask = (
+        (span_indices_u.view(1, -1, 1) < num_tiles_u.view(-1, 1, 1))  # (L, max_num_tiles_u, 1)
+        & (span_indices_v.view(1, 1, -1) < num_tiles_v.view(-1, 1, 1))  # (L, 1, max_num_tiles_v)
+    )  # (L, max_num_tiles_u, max_num_tiles_v)
+
+    # compute tile ids for each Gaussian
+    num_tiles_per_row = (width + T - 1) // T
+    tile_ids = tile_v[mask] * num_tiles_per_row + tile_u[mask]  # (sum(num_tiles_u * num_tiles_v),)
+
+    # scale up tile ids by number of Gaussians and add depth ordering
+    # so that Gaussians in the same tile will be grouped together and sorted by depth
+    z_ordering = torch.arange(L, device=means.device, dtype=torch.int64)
+    scaled_tile_ids = tile_ids * (L + 1) + z_ordering[gaussian_ids]
+    sorted_scaled_tile_ids, permutation = torch.sort(scaled_tile_ids)
+    gaussian_ids = gaussian_ids[permutation]
+    sorted_tile_ids = torch.div(sorted_scaled_tile_ids, L + 1, rounding_mode="floor")
+
+    # precompute inverse of covariance matrices for Gaussian evaluation
+    a = cov_img[:, 0, 0]
+    b = cov_img[:, 0, 1]
+    c = cov_img[:, 1, 0]
+    d = cov_img[:, 1, 1]
+    det = a * d - b * c
+    inv_det = 1.0 / det.clamp_min(1e-12)
+    covs_img_inv = torch.stack(
+        [
+            torch.stack([d * inv_det, -b * inv_det], dim=-1),
+            torch.stack([-c * inv_det, a * inv_det], dim=-1),
+        ],
+        dim=1,
+    )  # (L, 2, 2)
+
     rendered_image = torch.zeros((height, width, 3), device=means.device)  # (H, W, C)
-    for tile_u in range((width - 1) // T + 1):
-        for tile_v in range((height - 1) // T + 1):
-            in_tile_mask = (
-                (tile_u_min <= tile_u)
-                & (tile_u_max >= tile_u)
-                & (tile_v_min <= tile_v)
-                & (tile_v_max >= tile_v)
-            )  # (L,)
-            if not in_tile_mask.any():
-                continue
 
-            gs_points = torch.stack(
-                [u_img[in_tile_mask], v_img[in_tile_mask]], dim=1
-            )  # (G, 2) where G <= L
-            gs_colors = colors[in_tile_mask]  # (G, 3)
-            gs_opacities = opacities[in_tile_mask]  # (G,)
-            gs_covs = cov_img[in_tile_mask]  # (G, 2, 2)
-            a = gs_covs[:, 0, 0]
-            b = gs_covs[:, 0, 1]
-            c = gs_covs[:, 1, 0]
-            d = gs_covs[:, 1, 1]
-            det = a * d - b * c
-            inv_det = 1.0 / det.clamp_min(1e-12)
-            gs_covs_inv = torch.stack(
-                [
-                    torch.stack([d * inv_det, -b * inv_det], dim=-1),
-                    torch.stack([-c * inv_det, a * inv_det], dim=-1),
-                ],
-                dim=1,
-            )  # (G, 2, 2)
+    # iterate over tiles
+    unique_tile_ids, counts = torch.unique_consecutive(sorted_tile_ids, return_counts=True)
+    gs_count = 0
+    for tile_id, count in zip(unique_tile_ids.tolist(), counts.tolist()):
+        tu = tile_id % num_tiles_per_row
+        tv = tile_id // num_tiles_per_row
+        u0, v0 = tu * T, tv * T
+        u1, v1 = min(u0 + T, width), min(v0 + T, height)
+        if u1 <= u0 or v1 <= v0:
+            continue  # skip invalid tiles
 
-            u0, u1 = tile_u * T, min((tile_u + 1) * T, width)
-            v0, v1 = tile_v * T, min((tile_v + 1) * T, height)
-            tile_h = v1 - v0
-            tile_w = u1 - u0
-            pixel_u = torch.arange(u0, u1, device=means.device)  # (tile_w,)
-            pixel_v = torch.arange(v0, v1, device=means.device)  # (tile_h,)
-            pixel_uu, pixel_vv = torch.meshgrid(pixel_u, pixel_v, indexing="xy")  # (tile_w, tile_h)
-            pixel_coords = torch.stack([pixel_uu, pixel_vv], dim=-1).to(
-                gs_points.dtype
-            )  # (tile_w, tile_h, 2)
+        gs_ids = gaussian_ids[gs_count : gs_count + count]  # (G,), number of Gaussians in this tile
+        gs_u = u_img[gs_ids]  # (G,)
+        gs_v = v_img[gs_ids]  # (G,)
+        gs_colors = colors[gs_ids]  # (G, 3)
+        gs_opacities = opacities[gs_ids]  # (G,)
+        gs_covs_inv = covs_img_inv[gs_ids]  # (G, 2, 2)
+        gs_count += count
 
-            transmitance = torch.ones((tile_h, tile_w), device=means.device, dtype=gs_points.dtype)
-            contribution = torch.zeros(
-                (tile_h, tile_w, 3), device=means.device, dtype=gs_points.dtype
-            )
+        size_u, size_v = u1 - u0, v1 - v0
+        pixel_u, pixel_v = torch.meshgrid(
+            torch.arange(u0, u1, device=means.device),
+            torch.arange(v0, v1, device=means.device),
+            indexing="xy",
+        )  # (size_v, size_u)
+        du = pixel_u.view(-1, size_v, size_u) - gs_u.view(-1, 1, 1)  # (G, size_v, size_u)
+        dv = pixel_v.view(-1, size_v, size_u) - gs_v.view(-1, 1, 1)  # (G, size_v, size_u)
 
-            G = gs_points.shape[0]
-            for chunk_start in range(0, G, gaussian_chunk_size):
-                chunk_end = min(chunk_start + gaussian_chunk_size, G)
-                chunk_points = gs_points[chunk_start:chunk_end]  # (C, 2)
-                chunk_colors = gs_colors[chunk_start:chunk_end]  # (C, 3)
-                chunk_opacities = gs_opacities[chunk_start:chunk_end]  # (C,)
-                chunk_covs_inv = gs_covs_inv[chunk_start:chunk_end]  # (C, 2, 2)
+        C11 = gs_covs_inv[:, 0, 0].view(-1, 1, 1)
+        C12 = gs_covs_inv[:, 0, 1].view(-1, 1, 1)
+        C21 = gs_covs_inv[:, 1, 0].view(-1, 1, 1)
+        C22 = gs_covs_inv[:, 1, 1].view(-1, 1, 1)
+        exponent = C11 * du * du + (C12 + C21) * du * dv + C22 * dv * dv  # (G, size_v, size_u)
 
-                for idx in range(chunk_points.shape[0]):
-                    diff = pixel_coords - chunk_points[idx].view(1, 1, 2)  # (tile_h, tile_w, 2)
-                    exponent = torch.einsum(
-                        "...i,ij,...j->...", diff, chunk_covs_inv[idx], diff
-                    )  # (tile_h, tile_w)
-                    alpha = torch.exp(-0.5 * exponent) * chunk_opacities[idx]  # (tile_h, tile_w)
-                    alpha = torch.where(alpha < alpha_threshold, torch.zeros_like(alpha), alpha)
-                    contribution += (transmitance * alpha).unsqueeze(-1) * chunk_colors[idx].view(
-                        1, 1, 3
-                    )  # (tile_h, tile_w, 3)
-                    transmitance *= 1 - alpha + 1e-10
-                    transmitance = torch.where(
-                        transmitance < transmitance_threshold,
-                        torch.zeros_like(transmitance),
-                        transmitance,
-                    )
+        # zero out pixels outside the confidence interval
+        chi_mask = (exponent < chi_squared_threshold).float()
+        density = torch.exp(-0.5 * exponent) * chi_mask
 
-            rendered_image[v0:v1, u0:u1, :] = contribution
+        alpha = density * gs_opacities.view(-1, 1, 1)  # (G, size_v, size_u)
+        alpha = torch.where(alpha < alpha_threshold, torch.zeros_like(alpha), alpha)
 
-    return rendered_image * 255
+        one_minus_alpha = 1 - alpha + 1e-10
+        transmittance = torch.cumprod(one_minus_alpha, dim=0)  # (G, size_v, size_u)
+        transmittance[-1, :, :] = 1.0  # the last Gaussian does not get occluded
+        transmittance = torch.where(
+            transmittance < transmittance_threshold,
+            torch.zeros_like(transmittance),
+            transmittance,
+        )
+
+        contribution = ((transmittance * alpha).unsqueeze(-1) * gs_colors.view(-1, 1, 1, 3)).sum(
+            dim=0
+        )  # (size_v, size_u, 3)
+
+        rendered_image[v0:v1, u0:u1, :] = contribution
+
+    return rendered_image.clamp(0, 1) * 255
 
 
 def train():
@@ -517,7 +557,7 @@ def train():
         sh_degree_to_use = min(sh_degree, step // sh_degree_increase_step)
         # zero out gradients for unused SH coefficients
         if sh_degree_to_use < sh_degree:
-            gaussians["sh_coeffs_rest"].grad[:, (sh_degree_to_use + 1) ** 2 - 1 :, :].zero_()
+            sh_coeffs_rest.grad[:, (sh_degree_to_use + 1) ** 2 - 1 :, :].zero_()
 
         for optimizer in optimizers.values():
             optimizer.step()
