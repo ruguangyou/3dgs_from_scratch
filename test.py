@@ -24,24 +24,24 @@ def evaluate():
     cx, cy = width / 2, height / 2
     intrinsic = torch.tensor([[fx, 0, cx], [0, fy, cy], [0, 0, 1]], dtype=torch.float32).cuda()
 
+    image_scale = 0.5
+    intrinsic *= image_scale
+    width = int(width * image_scale)
+    height = int(height * image_scale)
+
     with torch.no_grad():
         for i, c2w in enumerate(orbit_c2ws):
             w2c = torch.zeros((4, 4), dtype=torch.float32).cuda()
             w2c[:3, :3] = c2w[:3, :3].t()
             w2c[:3, 3] = -(w2c[:3, :3] @ c2w[:3, 3])
             w2c[3, 3] = 1.0
-            image_scale = 0.5
-            camera = {
-                "world_to_camera": w2c.unsqueeze(0),
-                "intrinsic": (intrinsic * image_scale).unsqueeze(0),
-                "image": torch.zeros(
-                    (1, int(height * image_scale), int(width * image_scale), 3), dtype=torch.float32
-                ).cuda(),  # dummy image
-            }
 
             print("rendering frame", i)
             img = render(
-                camera,
+                w2c,
+                intrinsic,
+                width,
+                height,
                 pos,
                 scale,
                 q,

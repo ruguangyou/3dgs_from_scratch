@@ -206,7 +206,10 @@ def resize_camera(camera, image_scale: float):
 
 
 def render(
-    camera,
+    world_to_camera,
+    intrinsic,
+    width,
+    height,
     means,
     scales,
     quaternions,
@@ -223,17 +226,14 @@ def render(
     chi_squared_threshold=9.21,  # 99% confidence interval for 2 DOF
     device="cuda",
 ):
+    world_to_camera = world_to_camera.to(device)  # (4, 4)
+    intrinsic = intrinsic.to(device)  # (3, 3)
     means = means.to(device)  # (N, 3)
     scales = scales.to(device)  # (N, 3)
     quaternions = quaternions.to(device)  # (N, 4)
     opacities = opacities.to(device)  # (N,)
     sh_coeffs_dc = sh_coeffs_dc.to(device)  # (N, 3)
     sh_coeffs_rest = sh_coeffs_rest.to(device)  # (N, 15, 3)
-
-    # batch size is 1
-    world_to_camera = camera["world_to_camera"].squeeze(0).to(device)  # (1, 4, 4) -> (4, 4)
-    intrinsic = camera["intrinsic"].squeeze(0).to(device)  # (1, 3, 3) -> (3, 3)
-    height, width = camera["image"].shape[1:3]  # (1, H, W, C)
     N = means.shape[0]
 
     # transform Gaussian centers to camera space
@@ -251,6 +251,8 @@ def render(
     sh_coeffs_dc = sh_coeffs_dc[valid_depth_mask]  # (M, 3)
     sh_coeffs_rest = sh_coeffs_rest[valid_depth_mask]  # (M, 15, 3)
     M = points_cam.shape[1]
+    if M == 0:
+        return torch.zeros((height, width, 3), device=means.device, dtype=means.dtype)
 
     # evaluate spherical harmonics at the view direction
     camera_pos = -world_to_camera[:3, :3].t() @ world_to_camera[:3, 3]  # (3,)
@@ -295,6 +297,8 @@ def render(
     colors = colors[valid_mask]  # (K, 3)
     z = z[valid_mask]  # (K,)
     cov_img = cov_img[valid_mask]  # (K, 2, 2)
+    if u_img.shape[0] == 0:
+        return torch.zeros((height, width, 3), device=means.device, dtype=means.dtype)
 
     # valid mask for Gaussians that project within the image boundaries
     extend = 3  # extend up to 3 standard deviations to account for the Gaussian tails
@@ -322,6 +326,8 @@ def render(
     z = z[within_image_mask]  # (L,)
     cov_img = cov_img[within_image_mask]  # (L, 2, 2)
     L = u_img.shape[0]
+    if L == 0:
+        return torch.zeros((height, width, 3), device=means.device, dtype=means.dtype)
 
     # global sorting by depth for correct compositing order (near to far)
     order = torch.argsort(z, descending=False)
@@ -487,7 +493,7 @@ def train():
     initial_max_points = 10000
     initial_downsample_seed = 42
     image_scale = 0.5
-    debug = True
+    debug = False
 
     points, rgbs = downsample_point_cloud(
         points,
@@ -515,19 +521,34 @@ def train():
     )
 
     means = learnable_params["means"]
-    scales = torch.exp(learnable_params["scales"])
-    quaternions = learnable_params["quaternions"]
-    quaternions = quaternions / torch.norm(quaternions, dim=1, keepdim=True)
-    opacities = torch.sigmoid(learnable_params["opacities"])
     sh_coeffs_dc = learnable_params["sh_coeffs_dc"]
     sh_coeffs_rest = learnable_params["sh_coeffs_rest"]
 
     logging.info("Training started...")
     for step in tqdm(range(max_steps), desc="Training"):
-        camera = resize_camera(next(train_dataiter), image_scale=image_scale)
+        # recalculate the intermediate variables that depend on the learnable parameters
+        scales = torch.exp(learnable_params["scales"])
+        quaternions = learnable_params["quaternions"]
+        quaternions = quaternions / torch.norm(quaternions, dim=1, keepdim=True)
+        opacities = torch.sigmoid(learnable_params["opacities"])
+
+        try:
+            data = next(train_dataiter)
+        except StopIteration:
+            train_dataiter = iter(train_dataloader)
+            data = next(train_dataiter)
+        camera = resize_camera(data, image_scale=image_scale)
+
+        # batch size is 1, so squeeze the batch dimension
+        world_to_camera = camera["world_to_camera"].squeeze(0).cuda()  # (4, 4)
+        intrinsic = camera["intrinsic"].squeeze(0).cuda()  # (3, 3)
+        target_image = camera["image"].squeeze(0).cuda()  # (H, W, C)
 
         rendered_image = render(
-            camera,
+            world_to_camera,
+            intrinsic,
+            target_image.shape[1],
+            target_image.shape[0],
             means,
             scales,
             quaternions,
@@ -537,16 +558,16 @@ def train():
         )
 
         if debug and step % 100 == 0:
-            cv2.imshow("Rendered Image", rendered_image.cpu().numpy())
-            cv2.imshow("Target Image", camera["image"].cpu().numpy())
+            cv2.imshow("Rendered Image", rendered_image.detach().cpu().numpy())
+            cv2.imshow("Target Image", target_image.detach().cpu().numpy())
             cv2.waitKey(1)
 
         # L1 loss on pixel colors
-        l1_loss = torch.nn.functional.l1_loss(rendered_image, camera["image"])
+        l1_loss = torch.nn.functional.l1_loss(rendered_image, target_image)
         # Dissimilarity SSIM on structural similarity
         ssim_loss = 1.0 - fused_ssim(
-            rendered_image.permute(0, 3, 1, 2),  # (N, H, W, C) -> (N, C, H, W)
-            camera["image"].permute(0, 3, 1, 2),  # NCHW format for pytorch
+            rendered_image.permute(2, 0, 1).unsqueeze(0),  # (H, W, C) -> (1, C, H, W)
+            target_image.permute(2, 0, 1).unsqueeze(0),  # (H, W, C) -> (1, C, H, W)
             padding="valid",  # no padding to avoid border artifacts
         )
 
@@ -563,6 +584,27 @@ def train():
             optimizer.step()
             optimizer.zero_grad()
         means_scheduler.step()
+
+    # save the learned parameters and training configuration for later use
+    torch.save(
+        {
+            "learnable_params": learnable_params.state_dict(),
+            "optimizers": {name: optimizer.state_dict() for name, optimizer in optimizers.items()},
+            "means_scheduler": means_scheduler.state_dict(),
+            "training_config": {
+                "batch_size": batch_size,
+                "sh_degree": sh_degree,
+                "max_steps": max_steps,
+                "sh_degree_increase_step": sh_degree_increase_step,
+                "ssim_lambda": ssim_lambda,
+                "initial_max_points": initial_max_points,
+                "initial_downsample_seed": initial_downsample_seed,
+                "image_scale": image_scale,
+            },
+        },
+        "trained_gaussians.pth",
+    )
+    logging.info("Training completed and model saved.")
 
 
 if __name__ == "__main__":

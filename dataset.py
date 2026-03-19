@@ -152,6 +152,7 @@ class Dataset:
         return len(self.camera_ids)
 
     def __getitem__(self, idx):
+        idx = idx % len(self.camera_ids)  # wrap around for safety
         camera_id = self.camera_ids[idx]
         data = self.camera_data[camera_id]
         return {
