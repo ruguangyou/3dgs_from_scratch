@@ -22,6 +22,8 @@ def initialize(
     sh_degree: int = 3,
     device: str = "cuda",
 ):
+    # points shape: (N, 3)
+    # rgbs shape: (N, 3) in [0, 1] range
     N = points.shape[0]
 
     # initalize gaussians size to be the average distance of the 3 nearest neighbors
@@ -37,10 +39,13 @@ def initialize(
     # in logit space, after sigmoid the values will be constrained in (0, 1)
     opacities = torch.logit(torch.full((N,), init_opacity))
 
-    sh_coeffs = torch.zeros((N, (sh_degree + 1) ** 2, 3))  # (N, 16, 3) for degree 3
-    # initialize the first SH coefficients (the constant term) with the RGB colors
     C0 = 0.28209479177387814  # DC component of SH basis
-    sh_coeffs[:, 0, :] = (rgbs - 0.5) / C0  # Normalize to [-0.5, 0.5] and scale by C0
+    # normalize RGB colors to [-0.5, 0.5] and scale by C0 and initialize sh_coeffs_dc
+    sh_coeffs_dc = (rgbs - 0.5) / C0  # (N, 3) for the DC component of SH
+    # dc and rest of the SH coefficients are separated to apply for different learning rates
+    sh_coeffs_rest = torch.zeros(
+        (N, (sh_degree + 1) ** 2 - 1, 3)
+    )  # (N, 15, 3) for degree 3 excluding DC
 
     learnable_params = torch.nn.ParameterDict(
         {
@@ -48,9 +53,8 @@ def initialize(
             "scales": torch.nn.Parameter(scales),
             "quaternions": torch.nn.Parameter(quaternions),
             "opacities": torch.nn.Parameter(opacities),
-            # dc and rest of the SH coefficients are separated to apply for different learning rates
-            "sh_coeffs_dc": torch.nn.Parameter(sh_coeffs[:, 0, :]),
-            "sh_coeffs_rest": torch.nn.Parameter(sh_coeffs[:, 1:, :]),
+            "sh_coeffs_dc": torch.nn.Parameter(sh_coeffs_dc),
+            "sh_coeffs_rest": torch.nn.Parameter(sh_coeffs_rest),
         }
     ).to(device)
 
@@ -105,8 +109,9 @@ def quaternion_to_rotation_matrix(quaternions):
     return R
 
 
-def evaluate_spherical_harmonics(sh_coeffs, view_dirs):
-    # sh_coeffs shape: (N, 16, 3) for degree 3
+def evaluate_spherical_harmonics(sh_coeffs_dc, sh_coeffs_rest, view_dirs):
+    # sh_coeffs_dc shape: (N, 3) for degree 0
+    # sh_coeffs_rest shape: (N, 15, 3) for degree 1,2,3
     # view_dirs shape: (N, 3)
 
     SH_C0 = 0.28209479177387814
@@ -130,9 +135,8 @@ def evaluate_spherical_harmonics(sh_coeffs, view_dirs):
     xx, yy, zz = x * x, y * y, z * z
     xy, xz, yz = x * y, x * z, y * z
 
-    sh_basis = torch.stack(
+    sh_basis_rest = torch.stack(
         [
-            torch.full_like(x, SH_C0),  # l=0, m=0
             -SH_C1_y * y,  # l=1, m=-1
             SH_C1_z * z,  # l=1, m=0
             -SH_C1_x * x,  # l=1, m=1
@@ -150,9 +154,12 @@ def evaluate_spherical_harmonics(sh_coeffs, view_dirs):
             SH_C3_xxx_xyy * x * (xx - 3 * yy),  # l=3, m=3
         ],
         dim=1,
-    )  # (N, 16)
+    )  # (N, 15)
 
-    return torch.sigmoid((sh_coeffs * sh_basis.unsqueeze(-1)).sum(dim=1))  # (N, 3)
+    sh_dc = sh_coeffs_dc * SH_C0  # (N, 3)
+    sh_rest = (sh_coeffs_rest * sh_basis_rest.unsqueeze(-1)).sum(dim=1)  # (N, 3)
+
+    return torch.sigmoid(sh_dc + sh_rest)  # (N, 3)
 
 
 def downsample_point_cloud(
@@ -199,8 +206,13 @@ def resize_camera(camera, image_scale: float):
 
 
 def render(
-    gaussians,
     camera,
+    means,
+    scales,
+    quaternions,
+    opacities,
+    sh_coeffs_dc,
+    sh_coeffs_rest,
     near_plane=0.01,
     far_plane=100.0,
     min_opacity=1 / 255,
@@ -210,18 +222,12 @@ def render(
     transmitance_threshold=1e-4,
     device="cuda",
 ):
-    means = gaussians["means"].to(device)  # (N, 3)
-    scales = torch.exp(gaussians["scales"]).to(device)  # (N, 3), ensure positivity
-    quaternions = gaussians["quaternions"].to(device)  # (N, 4), normalize to unit length
-    quaternions = quaternions / torch.norm(quaternions, dim=1, keepdim=True)
-    opacities = torch.sigmoid(gaussians["opacities"]).to(device)  # (N,), constrain to (0, 1)
-    sh_coeffs = torch.cat(
-        [
-            gaussians["sh_coeffs_dc"].unsqueeze(1),  # (N, 3) -> (N, 1, 3)
-            gaussians["sh_coeffs_rest"],  # (N, 15, 3) for degree 3
-        ],
-        dim=1,
-    ).to(device)  # (N, 16, 3)
+    means = means.to(device)  # (N, 3)
+    scales = scales.to(device)  # (N, 3)
+    quaternions = quaternions.to(device)  # (N, 4)
+    opacities = opacities.to(device)  # (N,)
+    sh_coeffs_dc = sh_coeffs_dc.to(device)  # (N, 3)
+    sh_coeffs_rest = sh_coeffs_rest.to(device)  # (N, 15, 3)
 
     # batch size is 1
     world_to_camera = camera["world_to_camera"].squeeze(0).to(device)  # (1, 4, 4) -> (4, 4)
@@ -241,14 +247,15 @@ def render(
     scales = scales[valid_depth_mask]  # (M, 3)
     quaternions = quaternions[valid_depth_mask]  # (M, 4)
     opacities = opacities[valid_depth_mask]  # (M,)
-    sh_coeffs = sh_coeffs[valid_depth_mask]  # (M, 16, 3)
+    sh_coeffs_dc = sh_coeffs_dc[valid_depth_mask]  # (M, 3)
+    sh_coeffs_rest = sh_coeffs_rest[valid_depth_mask]  # (M, 15, 3)
     M = points_cam.shape[1]
 
     # evaluate spherical harmonics at the view direction
     camera_pos = -world_to_camera[:3, :3].t() @ world_to_camera[:3, 3]  # (3,)
     view_dirs = means[valid_depth_mask] - camera_pos.unsqueeze(0)  # (M, 3)
     view_dirs = view_dirs / torch.norm(view_dirs, dim=1, keepdim=True)
-    colors = evaluate_spherical_harmonics(sh_coeffs, view_dirs)  # (M, 3)
+    colors = evaluate_spherical_harmonics(sh_coeffs_dc, sh_coeffs_rest, view_dirs)  # (M, 3)
 
     # project Gaussian to image plane
     x, y, z = points_cam.unbind(0)  # (M,)
@@ -323,7 +330,7 @@ def render(
     cov_img = cov_img[order]
 
     # tiling
-    T = 256  # 16x16 pixel tiles
+    T = 16  # 16x16 pixel tiles
     radius_u = torch.sqrt(cov_img[:, 0, 0]) * extend  # (L,)
     radius_v = torch.sqrt(cov_img[:, 1, 1]) * extend  # (L,)
 
@@ -458,20 +465,36 @@ def train():
     logging.info(f"Initializing {points.shape[0]} gaussians...")
     points = torch.from_numpy(points).float()
     rgbs = torch.from_numpy(rgbs / 255.0).float()  # Normalize RGB values to [0, 1]
-    gaussians = initialize(points, rgbs, sh_degree=sh_degree)
+    learnable_params = initialize(points, rgbs, sh_degree=sh_degree)
 
     logging.info("Optimizer setup...")
-    optimizers = setup_optimizers(gaussians, batch_size)
+    optimizers = setup_optimizers(learnable_params, batch_size)
     # exponential decay, lr_at_end = 0.01 * lr_at_start
     means_scheduler = torch.optim.lr_scheduler.ExponentialLR(
         optimizers["means"], gamma=0.01 ** (1 / max_steps)
     )
 
+    means = learnable_params["means"]
+    scales = torch.exp(learnable_params["scales"])
+    quaternions = learnable_params["quaternions"]
+    quaternions = quaternions / torch.norm(quaternions, dim=1, keepdim=True)
+    opacities = torch.sigmoid(learnable_params["opacities"])
+    sh_coeffs_dc = learnable_params["sh_coeffs_dc"]
+    sh_coeffs_rest = learnable_params["sh_coeffs_rest"]
+
     logging.info("Training started...")
     for step in tqdm(range(max_steps), desc="Training"):
         camera = resize_camera(next(train_dataiter), image_scale=image_scale)
 
-        rendered_image = render(gaussians, camera)
+        rendered_image = render(
+            camera,
+            means,
+            scales,
+            quaternions,
+            opacities,
+            sh_coeffs_dc,
+            sh_coeffs_rest,
+        )
 
         if debug and step % 100 == 0:
             cv2.imshow("Rendered Image", rendered_image.cpu().numpy())

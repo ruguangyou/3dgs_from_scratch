@@ -1,30 +1,20 @@
-
 import torch
 from PIL import Image
 import numpy as np
-from main import render, resize_camera
+from main import render
 
 
 def evaluate():
-    pos = torch.load("test_data/pos_7000.pt").cuda()
-    opacity_raw = torch.load("test_data/opacity_raw_7000.pt").cuda()
-    f_dc = torch.load("test_data/f_dc_7000.pt").cuda()
+    pos = torch.load("test_data/pos_7000.pt").cuda()  # (N, 3)
+    scale_raw = torch.load("test_data/scale_raw_7000.pt").cuda()  # (N,)
+    scale = torch.exp(scale_raw)
+    opacity_raw = torch.load("test_data/opacity_raw_7000.pt").cuda()  # (N,)
+    opacity = torch.sigmoid(opacity_raw)
+    q_raw = torch.load("test_data/q_rot_7000.pt").cuda()  # (N, 4)
+    q = q_raw / torch.norm(q_raw, dim=1, keepdim=True)
+    f_dc = torch.load("test_data/f_dc_7000.pt").cuda()  # (N, 3)
     f_rest = torch.load("test_data/f_rest_7000.pt").cuda()
-    scale_raw = torch.load("test_data/scale_raw_7000.pt").cuda()
-    q_raw = torch.load("test_data/q_rot_7000.pt").cuda()
-    sh = torch.empty((pos.shape[0], 16, 3), device=pos.device, dtype=pos.dtype)
-    sh[:, 0] = f_dc
-    sh[:, 1:, 0] = f_rest[:, :15]  # R
-    sh[:, 1:, 1] = f_rest[:, 15:30]  # G
-    sh[:, 1:, 2] = f_rest[:, 30:45]  # B
-    gaussians = {
-        "means": pos,
-        "opacities": opacity_raw,
-        "sh_coeffs_dc": sh[:, 0, :],
-        "sh_coeffs_rest": sh[:, 1:, :],
-        "scales": scale_raw,
-        "quaternions": q_raw,
-    }
+    f_rest = f_rest.reshape(-1, 3, 15).permute(0, 2, 1)  # (N, 15, 3)
 
     cam_parameters = np.load("test_data/cam_meta.npy", allow_pickle=True).item()
     orbit_c2ws = torch.load("test_data/kitchen_orbit.pt").cuda()
@@ -40,20 +30,27 @@ def evaluate():
             w2c[:3, :3] = c2w[:3, :3].t()
             w2c[:3, 3] = -(w2c[:3, :3] @ c2w[:3, 3])
             w2c[3, 3] = 1.0
+            image_scale = 0.5
             camera = {
                 "world_to_camera": w2c.unsqueeze(0),
-                "intrinsic": intrinsic.unsqueeze(0),
+                "intrinsic": (intrinsic * image_scale).unsqueeze(0),
                 "image": torch.zeros(
-                    (1, height, width, 3), dtype=torch.float32
+                    (1, int(height * image_scale), int(width * image_scale), 3), dtype=torch.float32
                 ).cuda(),  # dummy image
-                "camera_id": 0,
             }
-            camera = resize_camera(camera, image_scale=0.5)
 
             print("rendering frame", i)
-            img = render(gaussians, camera)
+            img = render(
+                camera,
+                pos,
+                scale,
+                q,
+                opacity,
+                f_dc,
+                f_rest,
+            )
             print("saving frame", i)
-            
+
             Image.fromarray((img.cpu().detach().numpy()).astype(np.uint8)).save(
                 f"test_data/novel_views/frame_{i:04d}.png"
             )
