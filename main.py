@@ -449,8 +449,8 @@ def render(
         alpha = torch.where(alpha < alpha_threshold, torch.zeros_like(alpha), alpha)
 
         one_minus_alpha = 1 - alpha + 1e-10
-        transmittance = torch.cumprod(one_minus_alpha, dim=0)  # (G, size_v, size_u)
-        transmittance[-1, :, :] = 1.0  # the last Gaussian does not get occluded
+        transmittance = torch.ones_like(one_minus_alpha)  # (G, size_v, size_u)
+        transmittance[1:, :, :] = torch.cumprod(one_minus_alpha[:-1, :, :], dim=0)
         transmittance = torch.where(
             transmittance < transmittance_threshold,
             torch.zeros_like(transmittance),
