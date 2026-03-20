@@ -1,8 +1,9 @@
 import cv2
 import imageio.v2 as imageio
 import numpy as np
-from pycolmap import SceneManager
 import torch
+from pycolmap import SceneManager
+from torch.nn import functional as F
 from tqdm import tqdm
 
 
@@ -61,6 +62,27 @@ def load_colmap(data_dir):
         rgbs = scene_manager.point3D_colors.astype(np.uint8)
 
     return camera_data, points, rgbs
+
+
+def resize_camera(camera, image_scale: float):
+    if image_scale == 1.0:
+        return camera
+
+    resized_image = (
+        F.interpolate(
+            camera["image"].unsqueeze(0).permute(0, 3, 1, 2),  # (H, W, C) -> (1, C, H, W)
+            scale_factor=image_scale,
+            mode="bilinear",
+            align_corners=False,
+            recompute_scale_factor=False,
+        )
+        .permute(0, 2, 3, 1)
+        .squeeze(0)
+    )  # (1, C, H, W) -> (H, W, C)
+    camera["image"] = resized_image
+    camera["intrinsic"] *= image_scale
+
+    return camera
 
 
 class Camera:
@@ -140,8 +162,9 @@ class Camera:
 
 
 class Dataset:
-    def __init__(self, camera_data, split="train", test_every=8):
+    def __init__(self, camera_data, image_scale=1.0, split="train", test_every=8):
         self.camera_data = camera_data
+        self.image_scale = image_scale
         camera_ids = sorted(camera_data.keys())
         if split == "train":
             self.camera_ids = [cid for i, cid in enumerate(camera_ids) if i % test_every != 0]
@@ -155,9 +178,9 @@ class Dataset:
         idx = idx % len(self.camera_ids)  # wrap around for safety
         camera_id = self.camera_ids[idx]
         data = self.camera_data[camera_id]
-        return {
+        camera = {
             "world_to_camera": torch.from_numpy(data.world_to_camera).float(),
             "intrinsic": torch.from_numpy(data.intrinsic).float(),
             "image": torch.from_numpy(data.image).float(),
-            "camera_id": camera_id,
         }
+        return resize_camera(camera, self.image_scale)

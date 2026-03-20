@@ -1,23 +1,23 @@
 import torch
 from PIL import Image
 import numpy as np
-from main import render
+from src.torch_rasterizer import render
 
 
-def evaluate():
-    pos = torch.load("test_data/pos_7000.pt").cuda()  # (N, 3)
-    scale_raw = torch.load("test_data/scale_raw_7000.pt").cuda()  # (N,)
+def test():
+    pos = torch.load("logs/test/pos_7000.pt").cuda()  # (N, 3)
+    scale_raw = torch.load("logs/test/scale_raw_7000.pt").cuda()  # (N,)
     scale = torch.exp(scale_raw)
-    opacity_raw = torch.load("test_data/opacity_raw_7000.pt").cuda()  # (N,)
+    opacity_raw = torch.load("logs/test/opacity_raw_7000.pt").cuda()  # (N,)
     opacity = torch.sigmoid(opacity_raw)
-    q_raw = torch.load("test_data/q_rot_7000.pt").cuda()  # (N, 4)
+    q_raw = torch.load("logs/test/q_rot_7000.pt").cuda()  # (N, 4)
     q = q_raw / torch.norm(q_raw, dim=1, keepdim=True)
-    f_dc = torch.load("test_data/f_dc_7000.pt").cuda()  # (N, 3)
-    f_rest = torch.load("test_data/f_rest_7000.pt").cuda()
+    f_dc = torch.load("logs/test/f_dc_7000.pt").cuda()  # (N, 3)
+    f_rest = torch.load("logs/test/f_rest_7000.pt").cuda()
     f_rest = f_rest.reshape(-1, 3, 15).permute(0, 2, 1)  # (N, 15, 3)
 
-    cam_parameters = np.load("test_data/cam_meta.npy", allow_pickle=True).item()
-    orbit_c2ws = torch.load("test_data/kitchen_orbit.pt").cuda()
+    cam_parameters = np.load("logs/test/cam_meta.npy", allow_pickle=True).item()
+    orbit_c2ws = torch.load("logs/test/kitchen_orbit.pt").cuda()
     height = cam_parameters["height"]
     width = cam_parameters["width"]
     fx, fy = cam_parameters["fx"], cam_parameters["fy"]
@@ -52,9 +52,9 @@ def evaluate():
             print("saving frame", i)
 
             Image.fromarray((img.cpu().detach().numpy()).astype(np.uint8)).save(
-                f"test_data/novel_views/frame_{i:04d}.png"
+                f"logs/test/novel_views/frame_{i:04d}.png"
             )
 
 
 if __name__ == "__main__":
-    evaluate()
+    test()
