@@ -1,7 +1,6 @@
 import logging
 import math
 import pickle
-import cv2
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -9,6 +8,7 @@ from fused_ssim import fused_ssim
 from tqdm import tqdm
 from sklearn.neighbors import NearestNeighbors
 from dataset import load_colmap, Dataset
+from PIL import Image
 
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
@@ -487,10 +487,10 @@ def train():
 
     batch_size = 1
     sh_degree = 3
-    max_steps = 10000
+    max_steps = 5000
     sh_degree_increase_step = 1000
     ssim_lambda = 0.2
-    initial_max_points = 10000
+    initial_max_points = 100000
     initial_downsample_seed = 42
     image_scale = 0.5
     debug = False
@@ -558,9 +558,10 @@ def train():
         )
 
         if debug and step % 100 == 0:
-            cv2.imshow("Rendered Image", rendered_image.detach().cpu().numpy())
-            cv2.imshow("Target Image", target_image.detach().cpu().numpy())
-            cv2.waitKey(1)
+            concat_image = torch.cat([rendered_image, target_image], dim=1)  # (H, 2*W, C)
+            Image.fromarray(concat_image.detach().cpu().byte().numpy()).save(
+                f"logs/train/frame_{step}.png"
+            )
 
         # L1 loss on pixel colors
         l1_loss = torch.nn.functional.l1_loss(rendered_image, target_image)
@@ -602,10 +603,63 @@ def train():
                 "image_scale": image_scale,
             },
         },
-        "trained_gaussians.pth",
+        f"trained_gaussians_{max_steps}.pth",
     )
     logging.info("Training completed and model saved.")
 
 
+def evaluate():
+    # load the trained model
+    checkpoint = torch.load("trained_gaussians_5000.pth")
+    means = checkpoint["learnable_params"]["means"].cuda()
+    scales = checkpoint["learnable_params"]["scales"].cuda()
+    quaternions = checkpoint["learnable_params"]["quaternions"].cuda()
+    opacities = checkpoint["learnable_params"]["opacities"].cuda()
+    sh_coeffs_dc = checkpoint["learnable_params"]["sh_coeffs_dc"].cuda()
+    sh_coeffs_rest = checkpoint["learnable_params"]["sh_coeffs_rest"].cuda()
+    image_scale = checkpoint["training_config"]["image_scale"]
+
+    # load camera data for evaluation
+    with open("colmap_data/input_data.pkl", "rb") as f:
+        camera_data, _, _ = pickle.load(f)
+    eval_dataset = Dataset(camera_data, split="eval")
+    eval_dataloader = torch.utils.data.DataLoader(
+        eval_dataset,
+        batch_size=1,
+        shuffle=False,  # no shuffling for evaluation
+    )
+
+    eval_dataiter = iter(eval_dataloader)
+    for idx, data in enumerate(eval_dataiter):
+        camera = resize_camera(data, image_scale=image_scale)
+        world_to_camera = camera["world_to_camera"].squeeze(0).cuda()  # (4, 4)
+        intrinsic = camera["intrinsic"].squeeze(0).cuda()  # (3, 3)
+        target_image = camera["image"].squeeze(0).cuda()  # (H, W, C)
+
+        rendered_image = render(
+            world_to_camera,
+            intrinsic,
+            target_image.shape[1],
+            target_image.shape[0],
+            means,
+            torch.exp(scales),
+            quaternions / torch.norm(quaternions, dim=1, keepdim=True),
+            torch.sigmoid(opacities),
+            sh_coeffs_dc,
+            sh_coeffs_rest,
+        )
+
+        ssim_score = fused_ssim(
+            rendered_image.permute(2, 0, 1).unsqueeze(0),  # (H, W, C) -> (1, C, H, W)
+            target_image.permute(2, 0, 1).unsqueeze(0),  # (H, W, C) -> (1, C, H, W)
+            padding="valid",
+        ).item()
+        logging.info(f"Evaluation image {idx}: SSIM = {ssim_score:.4f}")
+
+        concat_image = torch.cat([rendered_image, target_image], dim=1)  # (H, 2*W, C)
+        Image.fromarray(concat_image.cpu().byte().numpy()).save(f"logs/eval/frame_{idx}.png")
+
+
 if __name__ == "__main__":
-    train()
+    # train()
+    evaluate()
