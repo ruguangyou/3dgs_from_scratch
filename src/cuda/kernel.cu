@@ -1,6 +1,7 @@
 #include <torch/extension.h>
 #include <cuda.h>
 #include <cuda_runtime.h>
+#include <cub/cub.cuh>
 
 constexpr float SH_C0 = 0.28209479177387814;
 constexpr float SH_C1_x = 0.4886025119029199;
@@ -145,10 +146,10 @@ __global__ void project_points_kernel(
     const float min_opacity,
     const float min_radius,
     const float max_radius,
-    const uint32_t width,
-    const uint32_t height,
+    const int32_t width,
+    const int32_t height,
     float *points_image,  // (N*2,)
-    float *depth,  // (N,)
+    float *depths,  // (N,)
     float *cov_inv_image,  // (N*3,)
     float *radii,  // (N*2,)
     bool *mask  // (N,)
@@ -217,7 +218,7 @@ __global__ void project_points_kernel(
     // output results
     points_image[idx*2] = u;
     points_image[idx*2 + 1] = v;
-    depth[idx] = point_camera.z;
+    depths[idx] = point_camera.z;
     cov_inv_image[idx*3] =  cov_image.z * inv_det;
     cov_inv_image[idx*3 + 1] = -cov_image.y * inv_det;
     cov_inv_image[idx*3 + 2] =  cov_image.x * inv_det;
@@ -286,6 +287,111 @@ __global__ void evaluate_spherical_harmonics_kernel(
     }
 }
 
+__global__ void count_tiles_kernel(
+    const uint32_t N,
+    const float *points_image,  // (N*2,)
+    const float *radii,  // (N*2,)
+    const bool *mask,  // (N,)
+    const int32_t width,
+    const int32_t height,
+    const int32_t tile_size,
+    int32_t *num_tiles  // (N,)
+) {
+    uint32_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= N || !mask[idx]) {
+        return;
+    }
+
+    float u = points_image[idx*2];
+    float v = points_image[idx*2 + 1];
+    float radius_u = radii[idx*2];
+    float radius_v = radii[idx*2 + 1];
+
+    int32_t u_min = max(0, (int32_t)floorf((u - radius_u)));
+    int32_t u_max = min((int32_t)ceilf((u + radius_u)), width - 1);
+    int32_t v_min = max(0, (int32_t)floorf((v - radius_v)));
+    int32_t v_max = min((int32_t)ceilf((v + radius_v)), height - 1);
+    if (u_min > u_max || v_min > v_max) {
+        num_tiles[idx] = 0;
+        return;
+    }
+
+    int32_t tile_u_min = u_min / tile_size;
+    int32_t tile_u_max = u_max / tile_size;
+    int32_t tile_v_min = v_min / tile_size;
+    int32_t tile_v_max = v_max / tile_size;
+    num_tiles[idx] = (tile_u_max - tile_u_min + 1) * (tile_v_max - tile_v_min + 1);
+}
+
+__global__ void compute_tile_intersection_kernel(
+    const uint32_t N,
+    const float *points_image,  // (N*2,)
+    const float *radii,  // (N*2,)
+    const float *depths,  // (N,)
+    const int64_t *cum_num_tiles,  // (N,)
+    const bool *mask,  // (N,)
+    const int32_t width,
+    const int32_t height,
+    const int32_t tile_size,
+    int64_t *tile_ids_encoded_depth,  // (total_tiles,)
+    int32_t *gaussian_ids  // (total_tiles,)
+) {
+    uint32_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= N || !mask[idx]) {
+        return;
+    }
+
+    float u = points_image[idx*2];
+    float v = points_image[idx*2 + 1];
+    float radius_u = radii[idx*2];
+    float radius_v = radii[idx*2 + 1];
+
+    int32_t u_min = min(max(0, (int32_t)floorf((u - radius_u))), width - 1);
+    int32_t u_max = min(max(0, (int32_t)floorf((u + radius_u))), width - 1);
+    int32_t v_min = min(max(0, (int32_t)floorf((v - radius_v))), height - 1);
+    int32_t v_max = min(max(0, (int32_t)floorf((v + radius_v))), height - 1);
+    if (u_min > u_max || v_min > v_max) {
+        return;
+    }
+    
+    int32_t num_tiles_per_row = (width + tile_size - 1) / tile_size;
+    int32_t tile_u_min = u_min / tile_size;
+    int32_t tile_u_max = u_max / tile_size;
+    int32_t tile_v_min = v_min / tile_size;
+    int32_t tile_v_max = v_max / tile_size;
+
+    // reinterpret float depth as int32 in bit-level (keep original bits)
+    int32_t depth_i32 = *((int32_t *)(&depths[idx]));
+    // instead of directly casting to int64_t which would sign-extend in case of negative depth
+    int64_t depth_i64 = (int64_t)depth_i32 & 0xFFFFFFFF;
+
+    // starting index for this gaussian in the output arrays
+    int64_t output_idx = idx > 0 ? cum_num_tiles[idx-1] : 0;
+    for (int32_t tile_v = tile_v_min; tile_v <= tile_v_max; ++tile_v) {
+        for (int32_t tile_u = tile_u_min; tile_u <= tile_u_max; ++tile_u) {
+            int64_t tile_id = (tile_v * num_tiles_per_row) + tile_u;
+            // encode tile id (upper 32 bits) and depth (lower 32 bits) for sorting
+            tile_ids_encoded_depth[output_idx] = (tile_id << 32) | depth_i64;
+            gaussian_ids[output_idx] = idx;
+            ++output_idx;
+        }
+    }
+}
+
+__global__ void shift_out_depth_kernel(
+    const int64_t total_tiles,
+    const int64_t *tile_ids_encoded_depth,  // (total_tiles,)
+    int32_t *tile_ids_sorted  // (total_tiles,)
+) {
+    uint32_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= total_tiles) {
+        return;
+    }
+
+    // decode tile id by shifting right 32 bits
+    tile_ids_sorted[idx] = (int32_t)(tile_ids_encoded_depth[idx] >> 32);
+}
+
 void launch_project_points_kernel(
     const torch::Tensor points_world,  // (N, 3)
     const torch::Tensor scales,  // (N, 3)
@@ -298,10 +404,10 @@ void launch_project_points_kernel(
     const float min_opacity,
     const float min_radius,
     const float max_radius,
-    const uint32_t width,
-    const uint32_t height,
+    const int32_t width,
+    const int32_t height,
     torch::Tensor points_image,  // (N, 2)
-    torch::Tensor depth,  // (N,)
+    torch::Tensor depths,  // (N,)
     torch::Tensor cov_inv_image,  // (N, 3)
     torch::Tensor radii,  // (N, 2)
     torch::Tensor mask  // (N,)
@@ -329,7 +435,7 @@ void launch_project_points_kernel(
         width,
         height,
         points_image.data_ptr<float>(),
-        depth.data_ptr<float>(),
+        depths.data_ptr<float>(),
         cov_inv_image.data_ptr<float>(),
         radii.data_ptr<float>(),
         mask.data_ptr<bool>()
@@ -360,4 +466,123 @@ void launch_evaluate_spherical_harmonics_kernel(
         mask.data_ptr<bool>(),
         colors.data_ptr<float>()
     );
+}
+
+void launch_count_tiles_kernel(
+    const torch::Tensor points_image,
+    const torch::Tensor radii,
+    const torch::Tensor mask,
+    const int32_t width,
+    const int32_t height,
+    const int32_t tile_size,
+    torch::Tensor num_tiles
+) {
+    int N = points_image.size(0);
+    if (N == 0) {
+        return;
+    }
+
+    int threads_per_block = 256;
+    int blocks = (N + threads_per_block - 1) / threads_per_block;
+    count_tiles_kernel<<<blocks, threads_per_block>>>(
+        N,
+        points_image.data_ptr<float>(),
+        radii.data_ptr<float>(),
+        mask.data_ptr<bool>(),
+        width,
+        height,
+        tile_size,
+        num_tiles.data_ptr<int32_t>()
+    );
+}
+
+void launch_compute_tile_intersection_kernel(
+    const torch::Tensor points_image,
+    const torch::Tensor radii,
+    const torch::Tensor depths,
+    const torch::Tensor cum_num_tiles,
+    const torch::Tensor mask,
+    const int32_t width,
+    const int32_t height,
+    const int32_t tile_size,
+    torch::Tensor tile_ids_encoded_depth,
+    torch::Tensor gaussian_ids
+) {
+    int N = points_image.size(0);
+    if (N == 0) {
+        return;
+    }
+
+    int threads_per_block = 256;
+    int blocks = (N + threads_per_block - 1) / threads_per_block;
+    compute_tile_intersection_kernel<<<blocks, threads_per_block>>>(
+        N,
+        points_image.data_ptr<float>(),
+        radii.data_ptr<float>(),
+        depths.data_ptr<float>(),
+        cum_num_tiles.data_ptr<int64_t>(),
+        mask.data_ptr<bool>(),
+        width,
+        height,
+        tile_size,
+        tile_ids_encoded_depth.data_ptr<int64_t>(),
+        gaussian_ids.data_ptr<int32_t>()
+    );
+}
+
+void radix_sort_double_buffer(
+    const int64_t num_items,
+    const torch::Tensor keys_in,
+    const torch::Tensor values_in,
+    torch::Tensor keys_out,
+    torch::Tensor values_out
+) {
+    cub::DoubleBuffer<int64_t> d_keys(
+        keys_in.data_ptr<int64_t>(), keys_out.data_ptr<int64_t>());
+    cub::DoubleBuffer<int32_t> d_values(
+        values_in.data_ptr<int32_t>(), values_out.data_ptr<int32_t>());
+    
+    // determine temporary device storage requirements
+    void *d_temp = nullptr;
+    size_t temp_bytes = 0;
+    cub::DeviceRadixSort::SortPairs(
+        d_temp, temp_bytes, d_keys, d_values, num_items);
+    cudaMalloc(&d_temp, temp_bytes);
+
+    // run sorting operation
+    cub::DeviceRadixSort::SortPairs(
+        d_temp, temp_bytes, d_keys, d_values, num_items);
+    cudaFree(d_temp);
+
+    // get sorted results
+    switch (d_keys.selector) {
+        case 0:  // sorted items are stored in keys_in
+            keys_out.set_(keys_in);
+            break;
+        case 1:  // sorted items are stored in keys_out
+            break;
+    }
+    switch (d_values.selector) {
+        case 0:  // sorted items are stored in values_in
+            values_out.set_(values_in);
+            break;
+        case 1:  // sorted items are stored in values_out
+            break;
+    }
+}
+
+void launch_shift_out_depth_kernel(
+    const int64_t total_tiles,
+    const torch::Tensor tile_ids_encoded_depth,
+    torch::Tensor tile_ids_sorted
+) {
+    if (total_tiles > 0) {
+        int threads_per_block = 256;
+        int blocks = (total_tiles + threads_per_block - 1) / threads_per_block;
+        shift_out_depth_kernel<<<blocks, threads_per_block>>>(
+            total_tiles,
+            tile_ids_encoded_depth.data_ptr<int64_t>(),
+            tile_ids_sorted.data_ptr<int32_t>()
+        );
+    }
 }

@@ -21,7 +21,7 @@ def render(
     transmittance_threshold=1e-4,
     chi_squared_threshold=9.21,  # 99% confidence interval for 2 DOF
 ):
-    points_img, depth, cov_inv_img, radii, mask = cuda_rasterizer.project_points(
+    points_img, depths, cov_inv_img, radii, mask = cuda_rasterizer.project_points(
         means,
         scales,
         quaternions,
@@ -40,4 +40,8 @@ def render(
     camera_pos = -world_to_camera[:3, :3].t() @ world_to_camera[:3, 3]
     colors = cuda_rasterizer.evaluate_spherical_harmonics(
         camera_pos, means, sh_coeffs_dc, sh_coeffs_rest, mask
+    )
+
+    tile_ids_sorted, gaussian_ids_sorted = cuda_rasterizer.compute_tile_intersection(
+        points_img, radii, depths, mask, width, height
     )
