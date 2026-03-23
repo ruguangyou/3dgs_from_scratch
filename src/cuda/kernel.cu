@@ -277,14 +277,19 @@ __global__ void evaluate_spherical_harmonics_kernel(
         SH_C3_xxx_xyy * x * (xx - 3 * yy),
     };
 
-    colors[idx*3] = sh_basis[0] * sh_coeffs_dc[idx*3];
-    colors[idx*3 + 1] = sh_basis[0] * sh_coeffs_dc[idx*3 + 1];
-    colors[idx*3 + 2] = sh_basis[0] * sh_coeffs_dc[idx*3 + 2];
+    float r = sh_basis[0] * sh_coeffs_dc[idx*3];
+    float g = sh_basis[0] * sh_coeffs_dc[idx*3 + 1];
+    float b = sh_basis[0] * sh_coeffs_dc[idx*3 + 2];
     for (int i = 0; i < 15; ++i) {
-        colors[idx*3] += sh_basis[i] * sh_coeffs_rest[(idx*15 + i)*3];
-        colors[idx*3 + 1] += sh_basis[i] * sh_coeffs_rest[(idx*15 + i)*3 + 1];
-        colors[idx*3 + 2] += sh_basis[i] * sh_coeffs_rest[(idx*15 + i)*3 + 2];
+        r += sh_basis[i] * sh_coeffs_rest[(idx*15 + i)*3];
+        g += sh_basis[i] * sh_coeffs_rest[(idx*15 + i)*3 + 1];
+        b += sh_basis[i] * sh_coeffs_rest[(idx*15 + i)*3 + 2];
     }
+
+    // normalize color to [0, 1] with sigmoid
+    colors[idx*3] = 1.0 / (1.0 + expf(-r));
+    colors[idx*3 + 1] = 1.0 / (1.0 + expf(-g));
+    colors[idx*3 + 2] = 1.0 / (1.0 + expf(-b));
 }
 
 __global__ void count_tiles_kernel(
