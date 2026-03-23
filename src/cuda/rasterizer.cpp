@@ -13,8 +13,8 @@ void launch_project_points_kernel(
     const float min_opacity,
     const float min_radius,
     const float max_radius,
-    const uint32_t width,
-    const uint32_t height,
+    const int32_t width,
+    const int32_t height,
     torch::Tensor points_image,
     torch::Tensor depths,
     torch::Tensor cov_inv_image,
@@ -35,9 +35,9 @@ void launch_count_tiles_kernel(
     const torch::Tensor points_image,
     const torch::Tensor radii,
     const torch::Tensor mask,
-    const uint32_t width,
-    const uint32_t height,
-    const uint32_t tile_size,
+    const int32_t width,
+    const int32_t height,
+    const int32_t tile_size,
     torch::Tensor num_tiles
 );
 
@@ -47,25 +47,24 @@ void launch_compute_tile_intersection_kernel(
     const torch::Tensor depth,
     const torch::Tensor cum_num_tiles,
     const torch::Tensor mask,
-    const uint32_t width,
-    const uint32_t height,
-    const uint32_t tile_size,
+    const int32_t width,
+    const int32_t height,
+    const int32_t tile_size,
     torch::Tensor tile_indices_encoded_depth,
     torch::Tensor gaussian_indices
 );
 
 void radix_sort_double_buffer(
-    const int64_t num_items,
+    const int32_t num_items,
     const torch::Tensor keys_in,
     const torch::Tensor values_in,
     torch::Tensor keys_out,
     torch::Tensor values_out
 );
 
-void launch_shift_out_depth_kernel(
-    const int64_t total_tiles,
+void launch_compute_indexing_offset_kernel(
     const torch::Tensor tile_ids_encoded_depth,
-    torch::Tensor tile_ids_sorted
+    torch::Tensor indexing_offset
 );
 
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
@@ -81,10 +80,10 @@ project_points(
     const float min_opacity,
     const float min_radius,
     const float max_radius,
-    const uint32_t width,
-    const uint32_t height
+    const int32_t width,
+    const int32_t height
 ) {
-    uint32_t N = points_world.size(0);
+    int N = points_world.size(0);
     torch::Tensor points_image = torch::zeros({N, 2}, torch::kFloat32);  // (N, 2)
     torch::Tensor depths = torch::zeros({N}, torch::kFloat32);  // (N,)
     torch::Tensor cov_inv_image = torch::zeros({N, 3}, torch::kFloat32);  // (N, 3)
@@ -142,13 +141,13 @@ std::tuple<torch::Tensor, torch::Tensor> compute_tile_intersection(
     const torch::Tensor radii,  // (N, 2)
     const torch::Tensor depths,  // (N,)
     const torch::Tensor mask,  // (N,)
-    const uint32_t width,
-    const uint32_t height,
-    const uint32_t tile_size = 16
+    const int32_t width,
+    const int32_t height,
+    const int32_t tile_size = 16
 ) {
     int N = points_image.size(0);
     torch::Tensor num_tiles = torch::zeros({N}, torch::kInt32);  // (N,)
-    torch::Tensor cum_num_tiles = torch::zeros({N}, torch::kInt64);  // (N,)
+    torch::Tensor cum_num_tiles = torch::zeros({N}, torch::kInt32);  // (N,)
 
     // compute number of tiles intersected by each projected gaussian
     launch_count_tiles_kernel(
@@ -165,7 +164,7 @@ std::tuple<torch::Tensor, torch::Tensor> compute_tile_intersection(
     cum_num_tiles = torch::cumsum(num_tiles, 0);
     
     // compute tile ids encoded with depth (for sorting) and gaussian ids
-    int64_t total_tiles = cum_num_tiles[-1].item<int64_t>();
+    int32_t total_tiles = cum_num_tiles[-1].item<int32_t>();
     torch::Tensor tile_ids_encoded_depth = torch::zeros({total_tiles}, torch::kInt64);
     torch::Tensor gaussian_ids = torch::zeros({total_tiles}, torch::kInt32);
     launch_compute_tile_intersection_kernel(
@@ -192,15 +191,16 @@ std::tuple<torch::Tensor, torch::Tensor> compute_tile_intersection(
         gaussian_ids_sorted
     );
 
-    // shift out depth
-    torch::Tensor tile_ids_sorted = torch::zeros({total_tiles}, torch::kInt32);
-    launch_shift_out_depth_kernel(
-        total_tiles,
+    // compute tile indexing offset
+    int32_t tile_width = (width + tile_size - 1) / tile_size;
+    int32_t tile_height = (height + tile_size - 1) / tile_size;
+    torch::Tensor indexing_offset = torch::zeros({tile_width * tile_height}, torch::kInt32);
+    launch_compute_indexing_offset_kernel(
         tile_ids_encoded_depth_sorted,
-        tile_ids_sorted
+        indexing_offset
     );
 
-    return std::make_tuple(tile_ids_sorted, gaussian_ids_sorted);
+    return std::make_tuple(indexing_offset, gaussian_ids_sorted);
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {

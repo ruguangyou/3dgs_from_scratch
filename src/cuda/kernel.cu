@@ -134,7 +134,7 @@ __device__ void transform_cov_w2c2i(
 }
 
 __global__ void project_points_kernel(
-    const uint32_t N,
+    const int32_t N,
     const float *points_world,  // (N*3,) row-major
     const float *scales,  // (N*3,)
     const float *quaternions,  // (N*4,)
@@ -154,7 +154,7 @@ __global__ void project_points_kernel(
     float *radii,  // (N*2,)
     bool *mask  // (N,)
 ) {
-    uint32_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int32_t idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= N) {
         return;
     }
@@ -227,7 +227,7 @@ __global__ void project_points_kernel(
 }
 
 __global__ void evaluate_spherical_harmonics_kernel(
-    const uint32_t N,
+    const int32_t N,
     const float *camera_pos,  // (3,)
     const float *world_points,  // (N*3,)
     const float *sh_coeffs_dc,  // (N*3,)
@@ -235,7 +235,7 @@ __global__ void evaluate_spherical_harmonics_kernel(
     const bool *mask,  // (N,)
     float *colors  // (N*3,)
 ) {
-    uint32_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int32_t idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= N || !mask[idx]) {
         return;
     }
@@ -288,7 +288,7 @@ __global__ void evaluate_spherical_harmonics_kernel(
 }
 
 __global__ void count_tiles_kernel(
-    const uint32_t N,
+    const int32_t N,
     const float *points_image,  // (N*2,)
     const float *radii,  // (N*2,)
     const bool *mask,  // (N,)
@@ -297,7 +297,7 @@ __global__ void count_tiles_kernel(
     const int32_t tile_size,
     int32_t *num_tiles  // (N,)
 ) {
-    uint32_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int32_t idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= N || !mask[idx]) {
         return;
     }
@@ -324,11 +324,11 @@ __global__ void count_tiles_kernel(
 }
 
 __global__ void compute_tile_intersection_kernel(
-    const uint32_t N,
+    const int32_t N,
     const float *points_image,  // (N*2,)
     const float *radii,  // (N*2,)
     const float *depths,  // (N,)
-    const int64_t *cum_num_tiles,  // (N,)
+    const int32_t *cum_num_tiles,  // (N,)
     const bool *mask,  // (N,)
     const int32_t width,
     const int32_t height,
@@ -336,7 +336,7 @@ __global__ void compute_tile_intersection_kernel(
     int64_t *tile_ids_encoded_depth,  // (total_tiles,)
     int32_t *gaussian_ids  // (total_tiles,)
 ) {
-    uint32_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int32_t idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= N || !mask[idx]) {
         return;
     }
@@ -366,30 +366,54 @@ __global__ void compute_tile_intersection_kernel(
     int64_t depth_i64 = (int64_t)depth_i32 & 0xFFFFFFFF;
 
     // starting index for this gaussian in the output arrays
-    int64_t output_idx = idx > 0 ? cum_num_tiles[idx-1] : 0;
+    int32_t output_idx = idx > 0 ? cum_num_tiles[idx-1] : 0;
     for (int32_t tile_v = tile_v_min; tile_v <= tile_v_max; ++tile_v) {
         for (int32_t tile_u = tile_u_min; tile_u <= tile_u_max; ++tile_u) {
-            int64_t tile_id = (tile_v * num_tiles_per_row) + tile_u;
+            int64_t tile_id_i64 = (tile_v * num_tiles_per_row) + tile_u;
             // encode tile id (upper 32 bits) and depth (lower 32 bits) for sorting
-            tile_ids_encoded_depth[output_idx] = (tile_id << 32) | depth_i64;
+            tile_ids_encoded_depth[output_idx] = (tile_id_i64 << 32) | depth_i64;
             gaussian_ids[output_idx] = idx;
             ++output_idx;
         }
     }
 }
 
-__global__ void shift_out_depth_kernel(
-    const int64_t total_tiles,
-    const int64_t *tile_ids_encoded_depth,  // (total_tiles,)
-    int32_t *tile_ids_sorted  // (total_tiles,)
+__global__ void compute_indexing_offset_kernel(
+    const int32_t total_tiles,
+    const int32_t unique_tiles,
+    const int64_t *tile_ids_encoded_depth_sorted,  // (total_tiles,)
+    int32_t *indexing_offset  // (tile_width * tile_height,)
 ) {
-    uint32_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int32_t idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= total_tiles) {
         return;
     }
 
     // decode tile id by shifting right 32 bits
-    tile_ids_sorted[idx] = (int32_t)(tile_ids_encoded_depth[idx] >> 32);
+    int32_t tile_id = (int32_t)(tile_ids_encoded_depth_sorted[idx] >> 32);
+
+    // e.g. tile_ids_sorted=[1, 1, 2, 3, 3, 5], total_tiles=6, unique_tiles=8
+    // then indexing_offset=[0, 0, 2, 3, 5, 5, 6, 6]
+    // indexing_offset[tile_id] <= offset < indexing_offset[tile_id+1] give the range
+    if (idx == 0) {
+        // set offset of the tiles before the fisrt tile having gaussians to 0 (inclusive)
+        for (int32_t i = 0; i <= tile_id; ++i) {
+            indexing_offset[i] = 0;
+        }
+    }
+    else if (idx == total_tiles - 1) {
+        // set offset of the tiles after the last tile having gaussians to total_tiles
+        for (int32_t i = tile_id + 1; i < unique_tiles; ++i) {
+            indexing_offset[i] = total_tiles;
+        }
+    }
+    else {
+        // set offset of the tiles between the previous tile and the current tile to idx
+        int32_t prev_tile_id = (int32_t)(tile_ids_encoded_depth_sorted[idx - 1] >> 32);
+        for (int32_t i = prev_tile_id + 1; i <= tile_id; ++i) {
+            indexing_offset[i] = idx;
+        }
+    }
 }
 
 void launch_project_points_kernel(
@@ -520,7 +544,7 @@ void launch_compute_tile_intersection_kernel(
         points_image.data_ptr<float>(),
         radii.data_ptr<float>(),
         depths.data_ptr<float>(),
-        cum_num_tiles.data_ptr<int64_t>(),
+        cum_num_tiles.data_ptr<int32_t>(),
         mask.data_ptr<bool>(),
         width,
         height,
@@ -531,9 +555,9 @@ void launch_compute_tile_intersection_kernel(
 }
 
 void radix_sort_double_buffer(
-    const int64_t num_items,
-    const torch::Tensor keys_in,
-    const torch::Tensor values_in,
+    const int32_t num_items,
+    const torch::Tensor keys_in,  // tile_ids_encoded_depth
+    const torch::Tensor values_in,  // gaussian_ids
     torch::Tensor keys_out,
     torch::Tensor values_out
 ) {
@@ -571,18 +595,20 @@ void radix_sort_double_buffer(
     }
 }
 
-void launch_shift_out_depth_kernel(
-    const int64_t total_tiles,
-    const torch::Tensor tile_ids_encoded_depth,
-    torch::Tensor tile_ids_sorted
+void launch_compute_indexing_offset_kernel(
+    const torch::Tensor tile_ids_encoded_depth_sorted,
+    torch::Tensor indexing_offset
 ) {
+    int total_tiles = tile_ids_encoded_depth_sorted.size(0);
     if (total_tiles > 0) {
+        int unique_tiles = indexing_offset.size(0);
         int threads_per_block = 256;
         int blocks = (total_tiles + threads_per_block - 1) / threads_per_block;
-        shift_out_depth_kernel<<<blocks, threads_per_block>>>(
+        compute_indexing_offset_kernel<<<blocks, threads_per_block>>>(
             total_tiles,
-            tile_ids_encoded_depth.data_ptr<int64_t>(),
-            tile_ids_sorted.data_ptr<int32_t>()
+            unique_tiles,
+            tile_ids_encoded_depth_sorted.data_ptr<int64_t>(),
+            indexing_offset.data_ptr<int32_t>()
         );
     }
 }
