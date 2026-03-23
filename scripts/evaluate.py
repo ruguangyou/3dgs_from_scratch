@@ -4,12 +4,12 @@ import torch
 from fused_ssim import fused_ssim
 from PIL import Image
 from src.dataset import Dataset
-from src.torch_rasterizer import render
+
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
 
-def evaluate(ckpt_path):
+def evaluate(ckpt_path, use_cuda_rasterizer=True):
     # load the trained model
     checkpoint = torch.load(ckpt_path)
     means = checkpoint["learnable_params"]["means"].cuda()
@@ -29,6 +29,11 @@ def evaluate(ckpt_path):
         batch_size=1,
         shuffle=False,  # no shuffling for evaluation
     )
+
+    if use_cuda_rasterizer:
+        from src.cuda.wrapper import render
+    else:
+        from src.torch_rasterizer import render
 
     eval_dataiter = iter(eval_dataloader)
     for idx, camera in enumerate(eval_dataiter):
@@ -62,4 +67,4 @@ def evaluate(ckpt_path):
 
 if __name__ == "__main__":
     ckpt_path = "logs/trained_gaussians_5000.pth"  # Update this path if needed
-    evaluate(ckpt_path)
+    evaluate(ckpt_path, use_cuda_rasterizer=True)

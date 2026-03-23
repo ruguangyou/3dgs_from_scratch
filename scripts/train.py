@@ -7,7 +7,6 @@ from tqdm import tqdm
 from PIL import Image
 from src.dataset import load_colmap, Dataset
 from src.gaussian import initialize, downsample_point_cloud
-from src.torch_rasterizer import render
 
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
@@ -53,6 +52,7 @@ def train(
     initial_max_points=100000,  # ignored if downsample_points is False
     image_scale=0.5,
     load_cached_input=True,
+    use_cuda_rasterizer=True,
     debug=False,
 ):
     data_dir = "colmap_data"
@@ -95,6 +95,11 @@ def train(
     means = learnable_params["means"]
     sh_coeffs_dc = learnable_params["sh_coeffs_dc"]
     sh_coeffs_rest = learnable_params["sh_coeffs_rest"]
+
+    if use_cuda_rasterizer:
+        from src.cuda.wrapper import render
+    else:
+        from src.torch_rasterizer import render
 
     logging.info("Training started...")
     for step in tqdm(range(max_steps), desc="Training"):
@@ -170,7 +175,6 @@ def train(
                 "sh_degree_increase_step": sh_degree_increase_step,
                 "ssim_lambda": ssim_lambda,
                 "initial_max_points": initial_max_points,
-                "initial_downsample_seed": initial_downsample_seed,
                 "image_scale": image_scale,
             },
         },
@@ -180,4 +184,4 @@ def train(
 
 
 if __name__ == "__main__":
-    train(max_steps=5000, downsample_points=True)
+    train(max_steps=5000, downsample_points=True, use_cuda_rasterizer=True)

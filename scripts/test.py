@@ -1,10 +1,9 @@
 import torch
 from PIL import Image
 import numpy as np
-from src.torch_rasterizer import render
 
 
-def test():
+def test(use_cuda_rasterizer=True):
     pos = torch.load("logs/test/pos_7000.pt").cuda()  # (N, 3)
     scale_raw = torch.load("logs/test/scale_raw_7000.pt").cuda()  # (N, 3)
     scale = torch.exp(scale_raw)
@@ -28,6 +27,11 @@ def test():
     intrinsic *= image_scale
     width = int(width * image_scale)
     height = int(height * image_scale)
+
+    if use_cuda_rasterizer:
+        from src.cuda.wrapper import render
+    else:
+        from src.torch_rasterizer import render
 
     with torch.no_grad():
         for i, c2w in enumerate(orbit_c2ws):
@@ -57,4 +61,4 @@ def test():
 
 
 if __name__ == "__main__":
-    test()
+    test(use_cuda_rasterizer=True)
