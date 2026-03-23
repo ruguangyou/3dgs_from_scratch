@@ -55,7 +55,7 @@ void launch_compute_tile_intersection_kernel(
 );
 
 void radix_sort_double_buffer(
-    const int32_t num_items,
+    const int64_t num_items,
     const torch::Tensor keys_in,
     const torch::Tensor values_in,
     torch::Tensor keys_out,
@@ -101,11 +101,15 @@ project_points(
     const int32_t height
 ) {
     int N = points_world.size(0);
-    torch::Tensor points_image = torch::zeros({N, 2}, torch::kFloat32);  // (N, 2)
-    torch::Tensor depths = torch::zeros({N}, torch::kFloat32);  // (N,)
-    torch::Tensor cov_inv_image = torch::zeros({N, 3}, torch::kFloat32);  // (N, 3)
-    torch::Tensor radii = torch::zeros({N, 2}, torch::kFloat32);  // (N, 2)
-    torch::Tensor mask = torch::ones({N}, torch::kBool);  // (N,)
+    
+    // use the options of input for output tensors, make sure device is the same
+    auto float_options = points_world.options().dtype(torch::kFloat32);
+    auto bool_options = points_world.options().dtype(torch::kBool);
+    torch::Tensor points_image = torch::zeros({N, 2}, float_options);  // (N, 2)
+    torch::Tensor depths = torch::zeros({N}, float_options);  // (N,)
+    torch::Tensor cov_inv_image = torch::zeros({N, 3}, float_options);  // (N, 3)
+    torch::Tensor radii = torch::zeros({N, 2}, float_options);  // (N, 2)
+    torch::Tensor mask = torch::ones({N}, bool_options);  // (N,)
 
     launch_project_points_kernel(
         points_world,
@@ -139,7 +143,8 @@ torch::Tensor evaluate_spherical_harmonics(
     const torch::Tensor mask  // (N,)
 ) {
     int N = world_points.size(0);
-    torch::Tensor colors = torch::zeros({N, 3}, torch::kFloat32);  // (N, 3)
+    auto float_options = world_points.options().dtype(torch::kFloat32);
+    torch::Tensor colors = torch::zeros({N, 3}, float_options);  // (N, 3)
 
     launch_evaluate_spherical_harmonics_kernel(
         camera_pos,
@@ -163,8 +168,10 @@ std::tuple<torch::Tensor, torch::Tensor> compute_tile_intersection(
     const int32_t tile_size = 16
 ) {
     int N = points_image.size(0);
-    torch::Tensor num_tiles = torch::zeros({N}, torch::kInt32);  // (N,)
-    torch::Tensor cum_num_tiles = torch::zeros({N}, torch::kInt32);  // (N,)
+    auto int_options = points_image.options().dtype(torch::kInt32);
+    auto int64_options = points_image.options().dtype(torch::kInt64);
+    torch::Tensor num_tiles = torch::zeros({N}, int_options);  // (N,)
+    torch::Tensor cum_num_tiles = torch::zeros({N}, int64_options);  // (N,)
 
     // compute number of tiles intersected by each projected gaussian
     launch_count_tiles_kernel(
@@ -178,12 +185,12 @@ std::tuple<torch::Tensor, torch::Tensor> compute_tile_intersection(
     );
 
     // compute cumulative sum to get starting index of gaussian in flattened tile list
-    cum_num_tiles = torch::cumsum(num_tiles, 0);
-    
+    cum_num_tiles = torch::cumsum(num_tiles, 0);  // cumsum returns int64 by default
+
     // compute tile ids encoded with depth (for sorting) and gaussian ids
-    int32_t total_tiles = cum_num_tiles[-1].item<int32_t>();
-    torch::Tensor tile_ids_encoded_depth = torch::zeros({total_tiles}, torch::kInt64);
-    torch::Tensor gaussian_ids = torch::zeros({total_tiles}, torch::kInt32);
+    int64_t total_tiles = cum_num_tiles[-1].item<int64_t>();
+    torch::Tensor tile_ids_encoded_depth = torch::zeros({total_tiles}, int64_options);
+    torch::Tensor gaussian_ids = torch::zeros({total_tiles}, int_options);
     launch_compute_tile_intersection_kernel(
         points_image,
         radii,
@@ -198,8 +205,8 @@ std::tuple<torch::Tensor, torch::Tensor> compute_tile_intersection(
     );
 
     // sort by tile id (upper 32 bits) and depth (lower 32 bits)
-    torch::Tensor tile_ids_encoded_depth_sorted = torch::zeros({total_tiles}, torch::kInt64);
-    torch::Tensor gaussian_ids_sorted = torch::zeros({total_tiles}, torch::kInt32);
+    torch::Tensor tile_ids_encoded_depth_sorted = torch::zeros({total_tiles}, int64_options);
+    torch::Tensor gaussian_ids_sorted = torch::zeros({total_tiles}, int_options);
     radix_sort_double_buffer(
         total_tiles,
         tile_ids_encoded_depth,
@@ -211,7 +218,7 @@ std::tuple<torch::Tensor, torch::Tensor> compute_tile_intersection(
     // compute tile indexing offset
     int32_t tile_width = (width + tile_size - 1) / tile_size;
     int32_t tile_height = (height + tile_size - 1) / tile_size;
-    torch::Tensor indexing_offset = torch::zeros({tile_width * tile_height}, torch::kInt32);
+    torch::Tensor indexing_offset = torch::zeros({tile_width * tile_height}, int_options);
     launch_compute_indexing_offset_kernel(
         tile_ids_encoded_depth_sorted,
         indexing_offset
@@ -235,7 +242,8 @@ torch::Tensor rasterize(
     const float transmittance_threshold,
     const float chi_squared_threshold
 ) {
-    torch::Tensor rendered_image = torch::zeros({height, width, 3}, torch::kFloat32);  // (H, W, 3)
+    auto float_options = points_image.options().dtype(torch::kFloat32);
+    torch::Tensor rendered_image = torch::zeros({height, width, 3}, float_options);  // (H, W, 3)
 
     launch_rasterize_kernel(
         indexing_offset,

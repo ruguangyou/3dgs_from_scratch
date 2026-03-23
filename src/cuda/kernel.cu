@@ -2,6 +2,7 @@
 #include <cuda.h>
 #include <cuda_runtime.h>
 #include <cub/cub.cuh>
+#include <c10/cuda/CUDAException.h>
 
 constexpr float SH_C0 = 0.28209479177387814;
 constexpr float SH_C1_x = 0.4886025119029199;
@@ -333,7 +334,7 @@ __global__ void compute_tile_intersection_kernel(
     const float *points_image,  // (N*2,)
     const float *radii,  // (N*2,)
     const float *depths,  // (N,)
-    const int32_t *cum_num_tiles,  // (N,)
+    const int64_t *cum_num_tiles,  // (N,)
     const bool *mask,  // (N,)
     const int32_t width,
     const int32_t height,
@@ -371,7 +372,7 @@ __global__ void compute_tile_intersection_kernel(
     int64_t depth_i64 = (int64_t)depth_i32 & 0xFFFFFFFF;
 
     // starting index for this gaussian in the output arrays
-    int32_t output_idx = idx > 0 ? cum_num_tiles[idx-1] : 0;
+    int64_t output_idx = idx > 0 ? cum_num_tiles[idx-1] : 0;
     for (int32_t tile_v = tile_v_min; tile_v <= tile_v_max; ++tile_v) {
         for (int32_t tile_u = tile_u_min; tile_u <= tile_u_max; ++tile_u) {
             int64_t tile_id_i64 = (tile_v * num_tiles_per_row) + tile_u;
@@ -537,6 +538,7 @@ void launch_project_points_kernel(
         radii.data_ptr<float>(),
         mask.data_ptr<bool>()
     );
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
 void launch_evaluate_spherical_harmonics_kernel(
@@ -563,6 +565,7 @@ void launch_evaluate_spherical_harmonics_kernel(
         mask.data_ptr<bool>(),
         colors.data_ptr<float>()
     );
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
 void launch_count_tiles_kernel(
@@ -591,6 +594,7 @@ void launch_count_tiles_kernel(
         tile_size,
         num_tiles.data_ptr<int32_t>()
     );
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
 void launch_compute_tile_intersection_kernel(
@@ -617,7 +621,7 @@ void launch_compute_tile_intersection_kernel(
         points_image.data_ptr<float>(),
         radii.data_ptr<float>(),
         depths.data_ptr<float>(),
-        cum_num_tiles.data_ptr<int32_t>(),
+        cum_num_tiles.data_ptr<int64_t>(),
         mask.data_ptr<bool>(),
         width,
         height,
@@ -625,31 +629,40 @@ void launch_compute_tile_intersection_kernel(
         tile_ids_encoded_depth.data_ptr<int64_t>(),
         gaussian_ids.data_ptr<int32_t>()
     );
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
 void radix_sort_double_buffer(
-    const int32_t num_items,
+    const int64_t num_items,
     const torch::Tensor keys_in,  // tile_ids_encoded_depth
     const torch::Tensor values_in,  // gaussian_ids
     torch::Tensor keys_out,
     torch::Tensor values_out
 ) {
+    if (num_items == 0) {
+        return;
+    }
+
     cub::DoubleBuffer<int64_t> d_keys(
         keys_in.data_ptr<int64_t>(), keys_out.data_ptr<int64_t>());
     cub::DoubleBuffer<int32_t> d_values(
         values_in.data_ptr<int32_t>(), values_out.data_ptr<int32_t>());
-    
+
     // determine temporary device storage requirements
     void *d_temp = nullptr;
     size_t temp_bytes = 0;
-    cub::DeviceRadixSort::SortPairs(
+    auto sort_status = cub::DeviceRadixSort::SortPairs(
         d_temp, temp_bytes, d_keys, d_values, num_items);
-    cudaMalloc(&d_temp, temp_bytes);
+    C10_CUDA_CHECK(sort_status);
+    C10_CUDA_CHECK(cudaGetLastError());
+    C10_CUDA_CHECK(cudaMalloc(&d_temp, temp_bytes));
 
     // run sorting operation
-    cub::DeviceRadixSort::SortPairs(
+    sort_status = cub::DeviceRadixSort::SortPairs(
         d_temp, temp_bytes, d_keys, d_values, num_items);
-    cudaFree(d_temp);
+    C10_CUDA_CHECK(sort_status);
+    C10_CUDA_CHECK(cudaGetLastError());
+    C10_CUDA_CHECK(cudaFree(d_temp));
 
     // get sorted results
     switch (d_keys.selector) {
@@ -683,6 +696,7 @@ void launch_compute_indexing_offset_kernel(
             tile_ids_encoded_depth_sorted.data_ptr<int64_t>(),
             indexing_offset.data_ptr<int32_t>()
         );
+        C10_CUDA_KERNEL_LAUNCH_CHECK();
     }
 }
 
@@ -730,4 +744,5 @@ void launch_rasterize_kernel(
         chi_squared_threshold,
         rendered_image.data_ptr<float>()
     );
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
