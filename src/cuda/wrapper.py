@@ -42,6 +42,25 @@ def render(
         camera_pos, means, sh_coeffs_dc, sh_coeffs_rest, mask
     )
 
+    tile_size = 16
     indexing_offset, gaussian_ids_sorted = cuda_rasterizer.compute_tile_intersection(
-        points_img, radii, depths, mask, width, height, tile_size=16
+        points_img, radii, depths, mask, width, height, tile_size
     )
+
+    rendered_image = cuda_rasterizer.rasterize(
+        indexing_offset,
+        gaussian_ids_sorted,
+        points_img,
+        cov_inv_img,
+        opacities,
+        colors,
+        mask,
+        width,
+        height,
+        tile_size,
+        alpha_threshold,
+        transmittance_threshold,
+        chi_squared_threshold,
+    )
+
+    return rendered_image * 255  # scale to [0, 255]

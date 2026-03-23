@@ -67,6 +67,23 @@ void launch_compute_indexing_offset_kernel(
     torch::Tensor indexing_offset
 );
 
+void launch_rasterize_kernel(
+    const torch::Tensor indexing_offset,
+    const torch::Tensor gaussian_ids_sorted,
+    const torch::Tensor points_image,
+    const torch::Tensor cov_inv_image,
+    const torch::Tensor opacities,
+    const torch::Tensor colors,
+    const torch::Tensor mask,
+    const int32_t width,
+    const int32_t height,
+    const int32_t tile_size,
+    const float alpha_threshold,
+    const float transmittance_threshold,
+    const float chi_squared_threshold,
+    torch::Tensor rendered_image
+);
+
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
 project_points(
     const torch::Tensor points_world,  // (N, 3)
@@ -203,6 +220,43 @@ std::tuple<torch::Tensor, torch::Tensor> compute_tile_intersection(
     return std::make_tuple(indexing_offset, gaussian_ids_sorted);
 }
 
+torch::Tensor rasterize(
+    const torch::Tensor indexing_offset,  // (unique_tiles,)
+    const torch::Tensor gaussian_ids_sorted,  // (total_tiles,)
+    const torch::Tensor points_image,  // (N, 2)
+    const torch::Tensor cov_inv_image,  // (N, 3)
+    const torch::Tensor opacities,  // (N,)
+    const torch::Tensor colors,  // (N, 3)
+    const torch::Tensor mask,  // (N,)
+    const int32_t width,
+    const int32_t height,
+    const int32_t tile_size,
+    const float alpha_threshold,
+    const float transmittance_threshold,
+    const float chi_squared_threshold
+) {
+    torch::Tensor rendered_image = torch::zeros({height, width, 3}, torch::kFloat32);  // (H, W, 3)
+
+    launch_rasterize_kernel(
+        indexing_offset,
+        gaussian_ids_sorted,
+        points_image,
+        cov_inv_image,
+        opacities,
+        colors,
+        mask,
+        width,
+        height,
+        tile_size,
+        alpha_threshold,
+        transmittance_threshold,
+        chi_squared_threshold,
+        rendered_image
+    );
+
+    return rendered_image;
+}
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("project_points",
           &project_points,
@@ -213,4 +267,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("compute_tile_intersection",
           &compute_tile_intersection,
           "Compute number of tiles intersected by each projected gaussian");
+    m.def("rasterize",
+          &rasterize,
+          "Rasterize gaussians to get rendered image");
 }

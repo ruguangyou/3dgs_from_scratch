@@ -416,6 +416,74 @@ __global__ void compute_indexing_offset_kernel(
     }
 }
 
+__global__ void rasterize_kernel(
+    const int32_t *indexing_offset,  // (unique_tiles,)
+    const int32_t *gaussian_ids_sorted, // (total_tiles,)
+    const float *points_image,  // (N*2,)
+    const float *cov_inv_image,  // (N*3,)
+    const float *opacities,  // (N,)
+    const float *colors,  // (N*3,)
+    const bool *mask,  // (N,)
+    const int32_t unique_tiles,
+    const int32_t total_tiles,
+    const int32_t num_tiles_per_row,
+    const int32_t width,
+    const int32_t height,
+    const int32_t tile_size,
+    const float alpha_threshold,
+    const float transmittance_threshold,
+    const float chi_squared_threshold,
+    float *output_image  // (height*width*3,)
+) {
+    int32_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int32_t u = idx % (num_tiles_per_row * tile_size);
+    int32_t v = idx / (num_tiles_per_row * tile_size);
+    if (u >= width || v >= height) {
+        return;
+    }
+
+    int32_t tile_id = blockIdx.x;  // each block processes one tile
+    if (tile_id >= unique_tiles) {
+        return;
+    }
+
+    float transmittance = 1.0f;
+    int32_t range_start = indexing_offset[tile_id];
+    int32_t range_end = (tile_id + 1 < unique_tiles) ? indexing_offset[tile_id+1] : total_tiles;
+    for (int32_t i = range_start; i < range_end; ++i) {
+        int32_t gaussian_id = gaussian_ids_sorted[i];
+        if (!mask[gaussian_id]) {
+            continue;
+        }
+
+        float du = u - points_image[gaussian_id*2];
+        float dv = v - points_image[gaussian_id*2 + 1];
+        float inv_cov_00 = cov_inv_image[gaussian_id*3];
+        float inv_cov_01 = cov_inv_image[gaussian_id*3 + 1];
+        float inv_cov_11 = cov_inv_image[gaussian_id*3 + 2];
+
+        float exponent = inv_cov_00 * du * du + 2.0 * inv_cov_01 * du * dv + inv_cov_11 * dv * dv;
+        if (exponent > chi_squared_threshold) {
+            continue;
+        }
+
+        float alpha = expf(-0.5f * exponent) * opacities[gaussian_id];
+        if (alpha < alpha_threshold) {
+            continue;
+        }
+
+        float weight = alpha * transmittance;
+        output_image[(v * width + u) * 3] += weight * colors[gaussian_id*3];
+        output_image[(v * width + u) * 3 + 1] += weight * colors[gaussian_id*3 + 1];
+        output_image[(v * width + u) * 3 + 2] += weight * colors[gaussian_id*3 + 2];
+
+        transmittance *= (1.0f - alpha);
+        if (transmittance < transmittance_threshold) {
+            break;
+        }
+    }
+}
+
 void launch_project_points_kernel(
     const torch::Tensor points_world,  // (N, 3)
     const torch::Tensor scales,  // (N, 3)
@@ -611,4 +679,50 @@ void launch_compute_indexing_offset_kernel(
             indexing_offset.data_ptr<int32_t>()
         );
     }
+}
+
+void launch_rasterize_kernel(
+    const torch::Tensor indexing_offset,  // (unique_tiles,)
+    const torch::Tensor gaussian_ids_sorted,  // (total_tiles,)
+    const torch::Tensor points_image,  // (N, 2)
+    const torch::Tensor cov_inv_image,  // (N, 3)
+    const torch::Tensor opacities,  // (N,)
+    const torch::Tensor colors,  // (N, 3)
+    const torch::Tensor mask,  // (N,)
+    const int32_t width,
+    const int32_t height,
+    const int32_t tile_size,
+    const float alpha_threshold,
+    const float transmittance_threshold,
+    const float chi_squared_threshold,
+    torch::Tensor rendered_image  // (height, width, 3)
+) {
+    int unique_tiles = indexing_offset.size(0);
+    int total_tiles = gaussian_ids_sorted.size(0);
+    if (unique_tiles == 0 || total_tiles == 0) {
+        return;
+    }
+
+    int num_tiles_per_row = (width + tile_size - 1) / tile_size;
+    int threads_per_block = tile_size * tile_size;  // one thread per pixel in a tile
+    int blocks = unique_tiles;  // one block per tile
+    rasterize_kernel<<<blocks, threads_per_block>>>(
+        indexing_offset.data_ptr<int32_t>(),
+        gaussian_ids_sorted.data_ptr<int32_t>(),
+        points_image.data_ptr<float>(),
+        cov_inv_image.data_ptr<float>(),
+        opacities.data_ptr<float>(),
+        colors.data_ptr<float>(),
+        mask.data_ptr<bool>(),
+        unique_tiles,
+        total_tiles,
+        num_tiles_per_row,
+        width,
+        height,
+        tile_size,
+        alpha_threshold,
+        transmittance_threshold,
+        chi_squared_threshold,
+        rendered_image.data_ptr<float>()
+    );
 }
