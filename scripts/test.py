@@ -6,7 +6,7 @@ from src.torch_rasterizer import render
 
 def test():
     pos = torch.load("logs/test/pos_7000.pt").cuda()  # (N, 3)
-    scale_raw = torch.load("logs/test/scale_raw_7000.pt").cuda()  # (N,)
+    scale_raw = torch.load("logs/test/scale_raw_7000.pt").cuda()  # (N, 3)
     scale = torch.exp(scale_raw)
     opacity_raw = torch.load("logs/test/opacity_raw_7000.pt").cuda()  # (N,)
     opacity = torch.sigmoid(opacity_raw)

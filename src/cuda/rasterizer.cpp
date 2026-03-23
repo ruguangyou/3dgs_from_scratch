@@ -185,7 +185,7 @@ std::tuple<torch::Tensor, torch::Tensor> compute_tile_intersection(
     );
 
     // compute cumulative sum to get starting index of gaussian in flattened tile list
-    cum_num_tiles = torch::cumsum(num_tiles, 0);  // cumsum returns int64 by default
+    cum_num_tiles = torch::cumsum(num_tiles, 0, torch::kInt64);  // cumsum returns int64 by default
 
     // compute tile ids encoded with depth (for sorting) and gaussian ids
     int64_t total_tiles = cum_num_tiles[-1].item<int64_t>();

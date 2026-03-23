@@ -49,10 +49,10 @@ __device__ void transform_cov_w2c2i(
     float3 &cov_image
 ) {
     // quaternion to rotation matrix
-    float qw = quaternion[0];
-    float qx = quaternion[1];
-    float qy = quaternion[2];
-    float qz = quaternion[3];
+    float qx = quaternion[0];
+    float qy = quaternion[1];
+    float qz = quaternion[2];
+    float qw = quaternion[3];
     float R[9] = {
         1 - 2*qy*qy - 2*qz*qz, 2*qx*qy - 2*qz*qw, 2*qx*qz + 2*qy*qw,
         2*qx*qy + 2*qz*qw, 1 - 2*qx*qx - 2*qz*qz, 2*qy*qz - 2*qx*qw,
@@ -113,6 +113,9 @@ __device__ void transform_cov_w2c2i(
     };
     
     // cov_image = J * cov_camera * J^T
+    //              Cc0 Cc1 Cc2
+    //  J0 0  J2    Cc3 Cc4 Cc5
+    //  0  J4 J5    Cc6 Cc7 Cc8
     float JCc[6] = {  // J * cov_camera
         J[0] * Cc[0] + J[2] * Cc[6],
         J[0] * Cc[1] + J[2] * Cc[7],
@@ -121,11 +124,14 @@ __device__ void transform_cov_w2c2i(
         J[4] * Cc[4] + J[5] * Cc[7],
         J[4] * Cc[5] + J[5] * Cc[8]
     };
+    //                    J0 0
+    //  JCc0 JCc1 JCc2    0  J4
+    //  JCc3 JCc4 JCc5    J2 J5
     float Ci[4] = {  // J * cov_camera * J^T
         JCc[0] * J[0] + JCc[2] * J[2],
-        JCc[1] * J[3] + JCc[2] * J[5],
+        JCc[1] * J[4] + JCc[2] * J[5],
         JCc[3] * J[0] + JCc[5] * J[2],
-        JCc[4] * J[3] + JCc[5] * J[5]
+        JCc[4] * J[4] + JCc[5] * J[5]
     };
 
     // ensure symmetry
@@ -282,9 +288,9 @@ __global__ void evaluate_spherical_harmonics_kernel(
     float g = sh_basis[0] * sh_coeffs_dc[idx*3 + 1];
     float b = sh_basis[0] * sh_coeffs_dc[idx*3 + 2];
     for (int i = 0; i < 15; ++i) {
-        r += sh_basis[i] * sh_coeffs_rest[(idx*15 + i)*3];
-        g += sh_basis[i] * sh_coeffs_rest[(idx*15 + i)*3 + 1];
-        b += sh_basis[i] * sh_coeffs_rest[(idx*15 + i)*3 + 2];
+        r += sh_basis[i+1] * sh_coeffs_rest[(idx*15 + i)*3];
+        g += sh_basis[i+1] * sh_coeffs_rest[(idx*15 + i)*3 + 1];
+        b += sh_basis[i+1] * sh_coeffs_rest[(idx*15 + i)*3 + 2];
     }
 
     // normalize color to [0, 1] with sigmoid
@@ -313,10 +319,10 @@ __global__ void count_tiles_kernel(
     float radius_u = radii[idx*2];
     float radius_v = radii[idx*2 + 1];
 
-    int32_t u_min = max(0, (int32_t)floorf((u - radius_u)));
-    int32_t u_max = min((int32_t)ceilf((u + radius_u)), width - 1);
-    int32_t v_min = max(0, (int32_t)floorf((v - radius_v)));
-    int32_t v_max = min((int32_t)ceilf((v + radius_v)), height - 1);
+    int32_t u_min = min(max(0, (int32_t)floorf((u - radius_u))), width - 1);
+    int32_t u_max = min(max(0, (int32_t)floorf((u + radius_u))), width - 1);
+    int32_t v_min = min(max(0, (int32_t)floorf((v - radius_v))), height - 1);
+    int32_t v_max = min(max(0, (int32_t)floorf((v + radius_v))), height - 1);
     if (u_min > u_max || v_min > v_max) {
         num_tiles[idx] = 0;
         return;
@@ -441,15 +447,17 @@ __global__ void rasterize_kernel(
     const float chi_squared_threshold,
     float *output_image  // (height*width*3,)
 ) {
-    int32_t idx = blockIdx.x * blockDim.x + threadIdx.x;
-    int32_t u = idx % (num_tiles_per_row * tile_size);
-    int32_t v = idx / (num_tiles_per_row * tile_size);
-    if (u >= width || v >= height) {
+    int32_t tile_id = blockIdx.x;  // each block processes one tile
+    int32_t idx_in_tile = threadIdx.x;  // each thread processes one pixel
+    if (tile_id >= unique_tiles) {
         return;
     }
 
-    int32_t tile_id = blockIdx.x;  // each block processes one tile
-    if (tile_id >= unique_tiles) {
+    int32_t row = tile_id / num_tiles_per_row;
+    int32_t col = tile_id % num_tiles_per_row;
+    int32_t u = col * tile_size + (idx_in_tile % tile_size);
+    int32_t v = row * tile_size + (idx_in_tile / tile_size);
+    if (u >= width || v >= height) {
         return;
     }
 
