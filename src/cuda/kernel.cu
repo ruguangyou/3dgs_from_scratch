@@ -930,84 +930,87 @@ __global__ void rasterize_backward_kernel(
     float grad_r = grad_output_image[(v * width + u) * 3];
     float grad_g = grad_output_image[(v * width + u) * 3 + 1];
     float grad_b = grad_output_image[(v * width + u) * 3 + 2];
+    if (grad_r == 0.0f && grad_g == 0.0f && grad_b == 0.0f) {
+        return;
+    }
 
-    float c_transmittance = 1.0f;
     int32_t range_start = indexing_offset[tile_id];
     int32_t range_end = (tile_id + 1 < unique_tiles) ? indexing_offset[tile_id+1] : total_tiles;
+    float final_transmittance = 1.0f;
+    int32_t active_end = range_end;
     for (int32_t i = range_start; i < range_end; ++i) {
-        // current gaussian
-        int32_t c_id = gaussian_ids_sorted[i];
-        float c_du = u - points_image[c_id*2];
-        float c_dv = v - points_image[c_id*2 + 1];
-        float c_inv_cov_00 = cov_inv_image[c_id*3];
-        float c_inv_cov_01 = cov_inv_image[c_id*3 + 1];
-        float c_inv_cov_11 = cov_inv_image[c_id*3 + 2];
+        int32_t gaussian_id = gaussian_ids_sorted[i];
+        float du = u - points_image[gaussian_id*2];
+        float dv = v - points_image[gaussian_id*2 + 1];
+        float inv_cov_00 = cov_inv_image[gaussian_id*3];
+        float inv_cov_01 = cov_inv_image[gaussian_id*3 + 1];
+        float inv_cov_11 = cov_inv_image[gaussian_id*3 + 2];
 
-        float exponent = c_inv_cov_00 * c_du * c_du + 2.0f * c_inv_cov_01 * c_du * c_dv + c_inv_cov_11 * c_dv * c_dv;
+        float exponent = inv_cov_00 * du * du + 2.0f * inv_cov_01 * du * dv + inv_cov_11 * dv * dv;
         if (exponent > chi_squared_threshold) {
             continue;
         }
 
-        float c_density = expf(-0.5f * exponent);
-        float c_alpha = c_density * opacities[c_id];
-        if (c_alpha < alpha_threshold) {
+        float alpha = expf(-0.5f * exponent) * opacities[gaussian_id];
+        if (alpha < alpha_threshold) {
             continue;
         }
 
-        float c_weight = c_alpha * c_transmittance;
-        float c_grad_u = c_inv_cov_00 * c_du + c_inv_cov_01 * c_dv;
-        float c_grad_v = c_inv_cov_01 * c_du + c_inv_cov_11 * c_dv;
-        float c_grad_rgb = grad_r * colors[c_id*3] + grad_g * colors[c_id*3 + 1] + grad_b * colors[c_id*3 + 2];
-
-        atomicAdd(&grad_colors[c_id*3], c_weight * grad_r);
-        atomicAdd(&grad_colors[c_id*3 + 1], c_weight * grad_g);
-        atomicAdd(&grad_colors[c_id*3 + 2], c_weight * grad_b);
-        atomicAdd(&grad_opacities[c_id], c_density * c_transmittance * c_grad_rgb);
-        atomicAdd(&grad_points_image[c_id*2], c_grad_u * c_weight * c_grad_rgb);
-        atomicAdd(&grad_points_image[c_id*2 + 1], c_grad_v * c_weight * c_grad_rgb);
-        atomicAdd(&grad_cov_inv_image[c_id*3], -0.5f * c_du * c_du * c_weight * c_grad_rgb);
-        atomicAdd(&grad_cov_inv_image[c_id*3 + 1], -c_du * c_dv * c_weight * c_grad_rgb);
-        atomicAdd(&grad_cov_inv_image[c_id*3 + 2], -0.5f * c_dv * c_dv * c_weight * c_grad_rgb);  
-
-        // farther gaussians
-        float f_transmittance = c_transmittance * (1.0f - c_alpha);
-        for (int j = i + 1; j < range_end; ++j) {
-            int32_t f_id = gaussian_ids_sorted[j];
-            float f_du = u - points_image[f_id*2];
-            float f_dv = v - points_image[f_id*2 + 1];
-            float f_inv_cov_00 = cov_inv_image[f_id*3];
-            float f_inv_cov_01 = cov_inv_image[f_id*3 + 1];
-            float f_inv_cov_11 = cov_inv_image[f_id*3 + 2];
-
-            exponent = f_inv_cov_00 * f_du * f_du + 2.0f * f_inv_cov_01 * f_du * f_dv + f_inv_cov_11 * f_dv * f_dv;
-            if (exponent > chi_squared_threshold) {
-                continue;
-            }
-
-            float f_alpha = expf(-0.5f * exponent) * opacities[f_id];
-            if (f_alpha < alpha_threshold) {
-                continue;
-            }
-
-            float f_grad_rgb = grad_r * colors[f_id*3] + grad_g * colors[f_id*3 + 1] + grad_b * colors[f_id*3 + 2];
-            float factor = -f_alpha * f_transmittance * f_grad_rgb / (1 - c_alpha + 1e-8f);
-            atomicAdd(&grad_opacities[c_id], c_density * factor);
-            atomicAdd(&grad_points_image[c_id*2], c_grad_u * c_alpha * factor);
-            atomicAdd(&grad_points_image[c_id*2 + 1], c_grad_v * c_alpha * factor);
-            atomicAdd(&grad_cov_inv_image[c_id*3], -0.5f * c_du * c_du * c_alpha * factor);
-            atomicAdd(&grad_cov_inv_image[c_id*3 + 1], -c_du * c_dv * c_alpha * factor);
-            atomicAdd(&grad_cov_inv_image[c_id*3 + 2], -0.5f * c_dv * c_dv * c_alpha * factor);
-
-            f_transmittance *= (1.0f - f_alpha);
-            if (f_transmittance < transmittance_threshold) {
-                break;
-            }
-        }
-
-        c_transmittance *= (1.0f - c_alpha);
-        if (c_transmittance < transmittance_threshold) {
+        final_transmittance *= (1.0f - alpha);
+        if (final_transmittance < transmittance_threshold) {
+            active_end = i + 1;
             break;
         }
+    }
+
+    if (active_end == range_start) {
+        return;
+    }
+
+    float suffix_weighted_color = 0.0f;
+    float transmittance_after = final_transmittance;
+    for (int32_t i = active_end - 1; i >= range_start; --i) {
+        int32_t gaussian_id = gaussian_ids_sorted[i];
+        float du = u - points_image[gaussian_id*2];
+        float dv = v - points_image[gaussian_id*2 + 1];
+        float inv_cov_00 = cov_inv_image[gaussian_id*3];
+        float inv_cov_01 = cov_inv_image[gaussian_id*3 + 1];
+        float inv_cov_11 = cov_inv_image[gaussian_id*3 + 2];
+
+        float exponent = inv_cov_00 * du * du + 2.0f * inv_cov_01 * du * dv + inv_cov_11 * dv * dv;
+        if (exponent > chi_squared_threshold) {
+            continue;
+        }
+
+        float density = expf(-0.5f * exponent);
+        float alpha = density * opacities[gaussian_id];
+        if (alpha < alpha_threshold) {
+            continue;
+        }
+
+        float one_minus_alpha = 1.0f - alpha;
+        float prefix_transmittance = transmittance_after / (one_minus_alpha + 1e-8f);
+        float weight = alpha * prefix_transmittance;
+        float grad_rgb = grad_r * colors[gaussian_id*3] +
+                         grad_g * colors[gaussian_id*3 + 1] +
+                         grad_b * colors[gaussian_id*3 + 2];
+        float grad_alpha = prefix_transmittance * grad_rgb -
+                           suffix_weighted_color / (one_minus_alpha + 1e-8f);
+        float grad_u = inv_cov_00 * du + inv_cov_01 * dv;
+        float grad_v = inv_cov_01 * du + inv_cov_11 * dv;
+
+        atomicAdd(&grad_colors[gaussian_id*3], weight * grad_r);
+        atomicAdd(&grad_colors[gaussian_id*3 + 1], weight * grad_g);
+        atomicAdd(&grad_colors[gaussian_id*3 + 2], weight * grad_b);
+        atomicAdd(&grad_opacities[gaussian_id], density * grad_alpha);
+        atomicAdd(&grad_points_image[gaussian_id*2], grad_u * alpha * grad_alpha);
+        atomicAdd(&grad_points_image[gaussian_id*2 + 1], grad_v * alpha * grad_alpha);
+        atomicAdd(&grad_cov_inv_image[gaussian_id*3], -0.5f * du * du * alpha * grad_alpha);
+        atomicAdd(&grad_cov_inv_image[gaussian_id*3 + 1], -du * dv * alpha * grad_alpha);
+        atomicAdd(&grad_cov_inv_image[gaussian_id*3 + 2], -0.5f * dv * dv * alpha * grad_alpha);
+
+        suffix_weighted_color += weight * grad_rgb;
+        transmittance_after = prefix_transmittance;
     }
 }
 
