@@ -13,6 +13,11 @@ from torch.utils.tensorboard import SummaryWriter
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
 
+def ensure_finite(name, tensor):
+    if not torch.isfinite(tensor).all():
+        raise RuntimeError(f"Non-finite values detected in {name}.")
+
+
 def setup_optimizers(
     gaussians,
     batch_size,
@@ -49,6 +54,11 @@ def train(
     max_steps=30000,
     sh_degree_increase_step=1000,
     ssim_lambda=0.2,
+    ssim_warmup_steps=3000,
+    grad_clip_norm=1.0,
+    scale_reg=0.01,
+    opacity_reset_interval=3000,
+    opacity_reset_value=0.01,
     downsample_points=False,
     initial_max_points=100000,  # ignored if downsample_points is False
     image_scale=0.5,
@@ -112,8 +122,8 @@ def train(
             "train/config",
             (
                 f"batch_size={batch_size}, sh_degree={sh_degree}, max_steps={max_steps}, "
-                f"ssim_lambda={ssim_lambda}, image_scale={image_scale}, "
-                f"use_cuda_rasterizer={use_cuda_rasterizer}"
+                f"ssim_lambda={ssim_lambda}, ssim_warmup_steps={ssim_warmup_steps}, "
+                f"image_scale={image_scale}, use_cuda_rasterizer={use_cuda_rasterizer}"
             ),
         )
 
@@ -130,8 +140,12 @@ def train(
             # recalculate the intermediate variables that depend on the learnable parameters
             scales = torch.exp(learnable_params["scales"])
             quaternions = learnable_params["quaternions"]
-            quaternions = quaternions / torch.norm(quaternions, dim=1, keepdim=True)
+            quaternions = quaternions / torch.norm(quaternions, dim=1, keepdim=True).clamp_min(1e-12)
             opacities = torch.sigmoid(learnable_params["opacities"])
+
+            ensure_finite("scales", scales)
+            ensure_finite("quaternions", quaternions)
+            ensure_finite("opacities", opacities)
 
             try:
                 camera = next(train_dataiter)
@@ -156,6 +170,7 @@ def train(
                 sh_coeffs_dc,
                 sh_coeffs_rest,
             )
+            ensure_finite("rendered_image", rendered_image)
 
             # L1 loss on pixel colors
             l1_loss = torch.nn.functional.l1_loss(rendered_image, target_image)
@@ -166,8 +181,31 @@ def train(
                 padding="valid",  # no padding to avoid border artifacts
             )
 
-            loss = (1 - ssim_lambda) * l1_loss + ssim_lambda * ssim_loss
+            # Linear SSIM warmup: 0 for the first ssim_warmup_steps, then ramp to ssim_lambda
+            if ssim_warmup_steps > 0 and step < ssim_warmup_steps:
+                effective_ssim_lambda = ssim_lambda * step / ssim_warmup_steps
+            else:
+                effective_ssim_lambda = ssim_lambda
+
+            loss = (1 - effective_ssim_lambda) * l1_loss + effective_ssim_lambda * ssim_loss
+            # Scale regularization: penalize large Gaussians (mirrors gsplat's scale_reg).
+            # Without a densification loop to prune oversized Gaussians, this is essential
+            # to prevent scale explosion in the CUDA rasterizer.
+            if scale_reg > 0.0:
+                loss = loss + scale_reg * scales.mean()
+            ensure_finite("loss", loss)
             loss.backward()
+
+            for name, param in learnable_params.items():
+                if param.grad is not None:
+                    ensure_finite(f"{name}.grad", param.grad)
+
+            # Clip gradients to prevent large-scale Gaussians from causing parameter explosion.
+            # When a Gaussian covers many pixels, du^2 terms in grad_cov_inv accumulate across
+            # all pixels via atomicAdd, potentially producing extremely large gradients.
+            if grad_clip_norm is not None and grad_clip_norm > 0:
+                all_params = list(learnable_params.values())
+                torch.nn.utils.clip_grad_norm_(all_params, grad_clip_norm)
 
             # increase SH degree every 1000 steps, to progressively learn higher frequency details
             sh_degree_to_use = min(sh_degree, step // sh_degree_increase_step)
@@ -180,11 +218,36 @@ def train(
                 optimizer.zero_grad()
             means_scheduler.step()
 
+            # Periodic opacity reset: force all Gaussians back to near-zero opacity,
+            # mimicking gsplat's DefaultStrategy reset_every=3000. Prevents bloated
+            # Gaussians from accumulating indefinitely without a full densification loop.
+            if opacity_reset_interval > 0 and step > 0 and step % opacity_reset_interval == 0:
+                with torch.no_grad():
+                    reset_logit = math.log(opacity_reset_value / (1.0 - opacity_reset_value))
+                    learnable_params["opacities"].fill_(reset_logit)
+                    # also reset the Adam second-moment to avoid stale momentum
+                    for key in ("opacities",):
+                        state = optimizers[key].state[learnable_params[key]]
+                        if "exp_avg" in state:
+                            state["exp_avg"].zero_()
+                        if "exp_avg_sq" in state:
+                            state["exp_avg_sq"].zero_()
+                logging.info(f"Step {step}: opacity reset to {opacity_reset_value}")
+
+            for name, param in learnable_params.items():
+                ensure_finite(name, param)
+
             if writer is not None:
                 writer.add_scalar("train/loss", loss.item(), step)
                 writer.add_scalar("train/l1_loss", l1_loss.item(), step)
                 writer.add_scalar("train/ssim_loss", ssim_loss.item(), step)
+                writer.add_scalar("train/ssim_lambda", effective_ssim_lambda, step)
                 writer.add_scalar("train/means_lr", optimizers["means"].param_groups[0]["lr"], step)
+                # monitor scale magnitude to detect explosion early
+                writer.add_scalar("train/scale_raw_abs_max",
+                                  learnable_params["scales"].abs().max().item(), step)
+                writer.add_scalar("train/opacity_mean",
+                                  opacities.mean().item(), step)
 
                 if step % tensorboard_image_interval == 0:
                     writer.add_image("train/rendered", to_tb_image(rendered_image), step)
@@ -210,6 +273,11 @@ def train(
                 "max_steps": max_steps,
                 "sh_degree_increase_step": sh_degree_increase_step,
                 "ssim_lambda": ssim_lambda,
+                "ssim_warmup_steps": ssim_warmup_steps,
+                "grad_clip_norm": grad_clip_norm,
+                "scale_reg": scale_reg,
+                "opacity_reset_interval": opacity_reset_interval,
+                "opacity_reset_value": opacity_reset_value,
                 "initial_max_points": initial_max_points,
                 "image_scale": image_scale,
             },
@@ -220,4 +288,13 @@ def train(
 
 
 if __name__ == "__main__":
-    train(max_steps=5000, downsample_points=True, use_cuda_rasterizer=True)
+    train(
+        max_steps=5000,
+        downsample_points=True,
+        initial_max_points=50000,
+        use_cuda_rasterizer=True,
+        ssim_warmup_steps=3000,
+        grad_clip_norm=1.0,
+        scale_reg=0.01,
+        opacity_reset_interval=3000,
+    )

@@ -438,7 +438,7 @@ __global__ void project_points_kernel(
 
     // compute inverse of covariance in image space
     float det = cov_image[idx*3] * cov_image[idx*3 + 2] - cov_image[idx*3 + 1] * cov_image[idx*3 + 1];
-    if (det <= 0) {
+    if (det <= 1e-5f) {
         mask[idx] = false;
         return;
     }
