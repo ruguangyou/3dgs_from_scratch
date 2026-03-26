@@ -140,12 +140,18 @@ __device__ void transform_cov_w2c2i(
     cov_image[2] = Ci[3];
 }
 
-__device__ void grad_point(
+__device__ void grad_projection_and_covariance(
     const float3 &point_camera,
     const float *W,
     const float *K,
     const float *grad_points_image,
-    float *grad_points_world
+    const float *scale,
+    const float *quaternion,
+    const float *cov_image,
+    const float *grad_cov_inv_image,
+    float *grad_points_world,
+    float *grad_scales,
+    float *grad_quaternions
 ) {
     float x = point_camera.x;
     float y = point_camera.y;
@@ -161,19 +167,7 @@ __device__ void grad_point(
         (grad_u * K[0] * (W[1] * z - W[9] * x) + grad_v * K[4] * (W[5] * z - W[9] * y)) * inv_z2;
     grad_points_world[2] =
         (-grad_u * K[0] * (W[10] * x - W[2] * z) - grad_v * K[4] * (W[10] * y - W[6] * z)) * inv_z2;
-}
 
-__device__ void grad_covariance(
-    const float3 &point_camera,
-    const float *W,
-    const float *K,
-    const float *scale,
-    const float *quaternion,
-    const float *cov_image,
-    const float *grad_cov_inv_image,
-    float *grad_scales,
-    float *grad_quaternions
-) {
     // E' = J * W * E * W^T * J^T
     //    = (J * W) * ((R * S) * S * R^T) * W^T * J^T
     //    = U * M * M^T * U^T
@@ -183,11 +177,9 @@ __device__ void grad_covariance(
     //  dE'_inv/dq = dE'_inv/dE' * dE'/dE * dE/dM * dM/dq
 
     // Jacobian of perspective projection
-    float inv_z = 1.0f / point_camera.z;
-    float inv_z2 = inv_z * inv_z;
     float J[6] = {
-        K[0] * inv_z, 0, -K[0] * point_camera.x * inv_z2,
-        0, K[4] * inv_z, -K[4] * point_camera.y * inv_z2
+        K[0] * inv_z, 0, -K[0] * x * inv_z2,
+        0, K[4] * inv_z, -K[4] * y * inv_z2
     };
 
     // U = J * W
@@ -257,19 +249,6 @@ __device__ void grad_covariance(
         -2.0f * sx * qj, 2.0f * sy * qi, 0.0f
     };
 
-    // dE/dM = 2 * M^T
-    float dE_dM[9][9] = {
-        {2.0f * M[0], M[3], M[6], M[3], 0.0f, 0.0f, M[6], 0.0f, 0.0f},
-        {2.0f * M[1], M[4], M[7], M[4], 0.0f, 0.0f, M[7], 0.0f, 0.0f},
-        {2.0f * M[2], M[5], M[8], M[5], 0.0f, 0.0f, M[8], 0.0f, 0.0f},
-        {0.0f, M[0], 0.0f, M[0], 2.0f * M[3], M[6], 0.0f, M[6], 0.0f},
-        {0.0f, M[1], 0.0f, M[1], 2.0f * M[4], M[7], 0.0f, M[7], 0.0f},
-        {0.0f, M[2], 0.0f, M[2], 2.0f * M[5], M[8], 0.0f, M[8], 0.0f},
-        {0.0f, 0.0f, M[0], 0.0f, 0.0f, M[3], M[0], M[3], 2.0f * M[6]},
-        {0.0f, 0.0f, M[1], 0.0f, 0.0f, M[4], M[1], M[4], 2.0f * M[7]},
-        {0.0f, 0.0f, M[2], 0.0f, 0.0f, M[5], M[2], M[5], 2.0f * M[8]}
-    };
-
     // dE'/dE_ij = [U0i * U0j, U0i * U1j, U0j * U1i, U1i * U1j]
     float dEp_dE[9][4] = {
         {U[0]*U[0], U[0]*U[3], U[0]*U[3], U[3]*U[3]},
@@ -308,16 +287,21 @@ __device__ void grad_covariance(
     for (int i = 0; i < 9; i++) {
         grad_E[i] = (
             grad_Ep[0] * dEp_dE[i][0] + 
-            grad_Ep[1] * (dEp_dE[i][1] + dEp_dE[i][2]) + 
+            0.5f * grad_Ep[1] * (dEp_dE[i][1] + dEp_dE[i][2]) + 
             grad_Ep[2] * dEp_dE[i][3]
         );
     }
 
     float grad_M[9];
-    for (int i = 0; i < 9; i++) {
-        grad_M[i] = 0.0f;
-        for (int j = 0; j < 9; j++) {
-            grad_M[i] += grad_E[j] * dE_dM[i][j];
+    for (int row = 0; row < 3; ++row) {
+        for (int col = 0; col < 3; ++col) {
+            float v = 0.0f;
+            for (int k = 0; k < 3; ++k) {
+                float g_rk = grad_E[row * 3 + k];
+                float g_kr = grad_E[k * 3 + row];
+                v += (g_rk + g_kr) * M[k * 3 + col];
+            }
+            grad_M[row * 3 + col] = v;
         }
     }
 
@@ -330,6 +314,71 @@ __device__ void grad_covariance(
         grad_quaternions[2] += grad_M[i] * dM_dqk[i];
         grad_quaternions[3] += grad_M[i] * dM_dqr[i];
     }
+ 
+    float E[9] = {
+        M[0] * M[0] + M[1] * M[1] + M[2] * M[2],
+        M[0] * M[3] + M[1] * M[4] + M[2] * M[5],
+        M[0] * M[6] + M[1] * M[7] + M[2] * M[8],
+        M[3] * M[0] + M[4] * M[1] + M[5] * M[2],
+        M[3] * M[3] + M[4] * M[4] + M[5] * M[5],
+        M[3] * M[6] + M[4] * M[7] + M[5] * M[8],
+        M[6] * M[0] + M[7] * M[1] + M[8] * M[2],
+        M[6] * M[3] + M[7] * M[4] + M[8] * M[5],
+        M[6] * M[6] + M[7] * M[7] + M[8] * M[8]
+    };
+    float WE[9] = {
+        W[0] * E[0] + W[1] * E[3] + W[2] * E[6],
+        W[0] * E[1] + W[1] * E[4] + W[2] * E[7],
+        W[0] * E[2] + W[1] * E[5] + W[2] * E[8],
+        W[4] * E[0] + W[5] * E[3] + W[6] * E[6],
+        W[4] * E[1] + W[5] * E[4] + W[6] * E[7],
+        W[4] * E[2] + W[5] * E[5] + W[6] * E[8],
+        W[8] * E[0] + W[9] * E[3] + W[10] * E[6],
+        W[8] * E[1] + W[9] * E[4] + W[10] * E[7],
+        W[8] * E[2] + W[9] * E[5] + W[10] * E[8]
+    };
+    float Cc[9] = {
+        WE[0] * W[0] + WE[1] * W[1] + WE[2] * W[2],
+        WE[0] * W[4] + WE[1] * W[5] + WE[2] * W[6],
+        WE[0] * W[8] + WE[1] * W[9] + WE[2] * W[10],
+        WE[3] * W[0] + WE[4] * W[1] + WE[5] * W[2],
+        WE[3] * W[4] + WE[4] * W[5] + WE[5] * W[6],
+        WE[3] * W[8] + WE[4] * W[9] + WE[5] * W[10],
+        WE[6] * W[0] + WE[7] * W[1] + WE[8] * W[2],
+        WE[6] * W[4] + WE[7] * W[5] + WE[8] * W[6],
+        WE[6] * W[8] + WE[7] * W[9] + WE[8] * W[10]
+    };
+
+    float g00 = grad_Ep[0];
+    float g01 = grad_Ep[1];
+    float g11 = grad_Ep[2];
+    float GJ_00 = g00 * J[0] + g01 * J[3];
+    float GJ_01 = g00 * J[1] + g01 * J[4];
+    float GJ_02 = g00 * J[2] + g01 * J[5];
+    float GJ_10 = g01 * J[0] + g11 * J[3];
+    float GJ_11 = g01 * J[1] + g11 * J[4];
+    float GJ_12 = g01 * J[2] + g11 * J[5];
+
+    float dLdJ_00 = 2.0f * (GJ_00 * Cc[0] + GJ_01 * Cc[3] + GJ_02 * Cc[6]);
+    float dLdJ_02 = 2.0f * (GJ_00 * Cc[2] + GJ_01 * Cc[5] + GJ_02 * Cc[8]);
+    float dLdJ_11 = 2.0f * (GJ_10 * Cc[1] + GJ_11 * Cc[4] + GJ_12 * Cc[7]);
+    float dLdJ_12 = 2.0f * (GJ_10 * Cc[2] + GJ_11 * Cc[5] + GJ_12 * Cc[8]);
+
+    float inv_z3 = inv_z2 * inv_z;
+
+    float fx = K[0];
+    float fy = K[4];
+    float grad_x_cam = dLdJ_02 * (-fx * inv_z2);
+    float grad_y_cam = dLdJ_12 * (-fy * inv_z2);
+    float grad_z_cam =
+        dLdJ_00 * (-fx * inv_z2) +
+        dLdJ_11 * (-fy * inv_z2) +
+        dLdJ_02 * (2.0f * fx * x * inv_z3) +
+        dLdJ_12 * (2.0f * fy * y * inv_z3);
+
+    grad_points_world[0] += W[0] * grad_x_cam + W[4] * grad_y_cam + W[8] * grad_z_cam;
+    grad_points_world[1] += W[1] * grad_x_cam + W[5] * grad_y_cam + W[9] * grad_z_cam;
+    grad_points_world[2] += W[2] * grad_x_cam + W[6] * grad_y_cam + W[10] * grad_z_cam;
 }
 
 __global__ void project_points_kernel(
@@ -449,24 +498,16 @@ __global__ void project_points_backward_kernel(
     float3 point_camera;
     transform_w2c(world_to_camera, &points_world[idx*3], point_camera);
 
-    // compute gradients w.r.t. point_world
-    grad_point(
+    grad_projection_and_covariance(
         point_camera,
         world_to_camera,
         intrinsic,
         &grad_points_image[idx*2],
-        &grad_points_world[idx*3]
-    );
-    
-    // compute gradients w.r.t. scale and quaternion
-    grad_covariance(
-        point_camera,
-        world_to_camera,
-        intrinsic,
         &scales[idx*3],
         &quaternions[idx*4],
         &cov_image[idx*3],
         &grad_cov_inv_image[idx*3],
+        &grad_points_world[idx*3],
         &grad_scales[idx*3],
         &grad_quaternions[idx*4]
     );
