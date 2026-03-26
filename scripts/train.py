@@ -1,12 +1,13 @@
 import logging
 import math
 import pickle
+from datetime import datetime
 import torch
 from fused_ssim import fused_ssim
 from tqdm import tqdm
-from PIL import Image
 from src.dataset import load_colmap, Dataset
 from src.gaussian import initialize, downsample_point_cloud
+from torch.utils.tensorboard import SummaryWriter
 
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
@@ -53,7 +54,9 @@ def train(
     image_scale=0.5,
     load_cached_input=True,
     use_cuda_rasterizer=True,
-    debug=False,
+    use_tensorboard=True,
+    tensorboard_log_dir="logs/tensorboard",
+    tensorboard_image_interval=100,
 ):
     data_dir = "colmap_data"
     if load_cached_input:
@@ -101,66 +104,99 @@ def train(
     else:
         from src.torch_rasterizer import render
 
-    logging.info("Training started...")
-    for step in tqdm(range(max_steps), desc="Training"):
-        # recalculate the intermediate variables that depend on the learnable parameters
-        scales = torch.exp(learnable_params["scales"])
-        quaternions = learnable_params["quaternions"]
-        quaternions = quaternions / torch.norm(quaternions, dim=1, keepdim=True)
-        opacities = torch.sigmoid(learnable_params["opacities"])
-
-        try:
-            camera = next(train_dataiter)
-        except StopIteration:
-            train_dataiter = iter(train_dataloader)
-            camera = next(train_dataiter)
-
-        # batch size is 1, so squeeze the batch dimension
-        world_to_camera = camera["world_to_camera"].squeeze(0).cuda()  # (4, 4)
-        intrinsic = camera["intrinsic"].squeeze(0).cuda()  # (3, 3)
-        target_image = camera["image"].squeeze(0).cuda()  # (H, W, C)
-
-        rendered_image = render(
-            world_to_camera,
-            intrinsic,
-            target_image.shape[1],
-            target_image.shape[0],
-            means,
-            scales,
-            quaternions,
-            opacities,
-            sh_coeffs_dc,
-            sh_coeffs_rest,
+    writer = None
+    if use_tensorboard:
+        run_name = datetime.now().strftime("%Y%m%d-%H%M%S")
+        writer = SummaryWriter(log_dir=f"{tensorboard_log_dir}/{run_name}")
+        writer.add_text(
+            "train/config",
+            (
+                f"batch_size={batch_size}, sh_degree={sh_degree}, max_steps={max_steps}, "
+                f"ssim_lambda={ssim_lambda}, image_scale={image_scale}, "
+                f"use_cuda_rasterizer={use_cuda_rasterizer}"
+            ),
         )
 
-        if debug and step % 100 == 0:
-            concat_image = torch.cat([rendered_image, target_image], dim=1)  # (H, 2*W, C)
-            Image.fromarray(concat_image.detach().cpu().byte().numpy()).save(
-                f"logs/train/frame_{step}.png"
+    def to_tb_image(image_hwc: torch.Tensor) -> torch.Tensor:
+        image = image_hwc.detach().float()
+        image = image.permute(2, 0, 1)
+        if image.max() > 1.0:
+            image = image / 255.0
+        return image.clamp(0.0, 1.0)
+
+    logging.info("Training started...")
+    try:
+        for step in tqdm(range(max_steps), desc="Training"):
+            # recalculate the intermediate variables that depend on the learnable parameters
+            scales = torch.exp(learnable_params["scales"])
+            quaternions = learnable_params["quaternions"]
+            quaternions = quaternions / torch.norm(quaternions, dim=1, keepdim=True)
+            opacities = torch.sigmoid(learnable_params["opacities"])
+
+            try:
+                camera = next(train_dataiter)
+            except StopIteration:
+                train_dataiter = iter(train_dataloader)
+                camera = next(train_dataiter)
+
+            # batch size is 1, so squeeze the batch dimension
+            world_to_camera = camera["world_to_camera"].squeeze(0).cuda()  # (4, 4)
+            intrinsic = camera["intrinsic"].squeeze(0).cuda()  # (3, 3)
+            target_image = camera["image"].squeeze(0).cuda()  # (H, W, C)
+
+            rendered_image = render(
+                world_to_camera,
+                intrinsic,
+                target_image.shape[1],
+                target_image.shape[0],
+                means,
+                scales,
+                quaternions,
+                opacities,
+                sh_coeffs_dc,
+                sh_coeffs_rest,
             )
 
-        # L1 loss on pixel colors
-        l1_loss = torch.nn.functional.l1_loss(rendered_image, target_image)
-        # Dissimilarity SSIM on structural similarity
-        ssim_loss = 1.0 - fused_ssim(
-            rendered_image.permute(2, 0, 1).unsqueeze(0),  # (H, W, C) -> (1, C, H, W)
-            target_image.permute(2, 0, 1).unsqueeze(0),  # (H, W, C) -> (1, C, H, W)
-            padding="valid",  # no padding to avoid border artifacts
-        )
+            # L1 loss on pixel colors
+            l1_loss = torch.nn.functional.l1_loss(rendered_image, target_image)
+            # Dissimilarity SSIM on structural similarity
+            ssim_loss = 1.0 - fused_ssim(
+                rendered_image.permute(2, 0, 1).unsqueeze(0),  # (H, W, C) -> (1, C, H, W)
+                target_image.permute(2, 0, 1).unsqueeze(0),  # (H, W, C) -> (1, C, H, W)
+                padding="valid",  # no padding to avoid border artifacts
+            )
 
-        loss = (1 - ssim_lambda) * l1_loss + ssim_lambda * ssim_loss
-        loss.backward()
+            loss = (1 - ssim_lambda) * l1_loss + ssim_lambda * ssim_loss
+            loss.backward()
 
-        # increase SH degree every 1000 steps, to progressively learn higher frequency details
-        sh_degree_to_use = min(sh_degree, step // sh_degree_increase_step)
-        # zero out gradients for unused SH coefficients
-        if sh_degree_to_use < sh_degree:
-            sh_coeffs_rest.grad[:, (sh_degree_to_use + 1) ** 2 - 1 :, :].zero_()
+            # increase SH degree every 1000 steps, to progressively learn higher frequency details
+            sh_degree_to_use = min(sh_degree, step // sh_degree_increase_step)
+            # zero out gradients for unused SH coefficients
+            if sh_degree_to_use < sh_degree:
+                sh_coeffs_rest.grad[:, (sh_degree_to_use + 1) ** 2 - 1 :, :].zero_()
 
-        for optimizer in optimizers.values():
-            optimizer.step()
-            optimizer.zero_grad()
-        means_scheduler.step()
+            for optimizer in optimizers.values():
+                optimizer.step()
+                optimizer.zero_grad()
+            means_scheduler.step()
+
+            if writer is not None:
+                writer.add_scalar("train/loss", loss.item(), step)
+                writer.add_scalar("train/l1_loss", l1_loss.item(), step)
+                writer.add_scalar("train/ssim_loss", ssim_loss.item(), step)
+                writer.add_scalar("train/means_lr", optimizers["means"].param_groups[0]["lr"], step)
+
+                if step % tensorboard_image_interval == 0:
+                    writer.add_image("train/rendered", to_tb_image(rendered_image), step)
+                    writer.add_image("train/target", to_tb_image(target_image), step)
+                    writer.add_image(
+                        "train/concat",
+                        to_tb_image(torch.cat([rendered_image, target_image], dim=1)),
+                        step,
+                    )
+    finally:
+        if writer is not None:
+            writer.close()
 
     # save the learned parameters and training configuration for later use
     torch.save(
