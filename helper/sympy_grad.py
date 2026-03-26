@@ -5,7 +5,7 @@ xp, yp, zp, xc, yc, zc, n = symbols("xp yp zp xt yt zt n")
 dx, dy, dz = symbols("dx dy dz")
 n, n2, x, y, z = symbols("n n2 x y z")
 dx, dy, dz = xp - xc, yp - yc, zp - zc
-n = sqrt(dx ** 2 + dy ** 2 + dz ** 2)
+n = sqrt(dx**2 + dy**2 + dz**2)
 x, y, z = dx / n, dy / n, dz / n
 
 subs_map = {
