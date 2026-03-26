@@ -80,12 +80,12 @@ class SphericalHarmonicsFunction(torch.autograd.Function):
         colors = cuda_rasterizer.evaluate_spherical_harmonics(
             camera_pos, means, sh_coeffs_dc, sh_coeffs_rest, mask
         )
-        ctx.save_for_backward(camera_pos, means, sh_coeffs_dc, sh_coeffs_rest, mask)
+        ctx.save_for_backward(camera_pos, means, sh_coeffs_dc, sh_coeffs_rest, colors, mask)
         return colors
 
     @staticmethod
     def backward(ctx, grad_colors):
-        camera_pos, means, sh_coeffs_dc, sh_coeffs_rest, mask = ctx.saved_tensors
+        camera_pos, means, sh_coeffs_dc, sh_coeffs_rest, colors, mask = ctx.saved_tensors
         grad_means, grad_sh_coeffs_dc, grad_sh_coeffs_rest = (
             cuda_rasterizer.evaluate_spherical_harmonics_backward(
                 grad_colors,
@@ -93,6 +93,7 @@ class SphericalHarmonicsFunction(torch.autograd.Function):
                 means,
                 sh_coeffs_dc,
                 sh_coeffs_rest,
+                colors,
                 mask,
             )
         )
@@ -131,7 +132,12 @@ class RasterizeFunction(torch.autograd.Function):
             chi_squared_threshold,
         )
         ctx.save_for_backward(
-            indexing_offset, gaussian_ids_sorted, points_img, cov_inv_img, opacities, colors
+            indexing_offset,
+            gaussian_ids_sorted,
+            points_img,
+            cov_inv_img,
+            opacities,
+            colors,
         )
         ctx.width = width
         ctx.height = height
@@ -143,9 +149,14 @@ class RasterizeFunction(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_rendered_image):
-        indexing_offset, gaussian_ids_sorted, points_img, cov_inv_img, opacities, colors = (
-            ctx.saved_tensors
-        )
+        (
+            indexing_offset,
+            gaussian_ids_sorted,
+            points_img,
+            cov_inv_img,
+            opacities,
+            colors,
+        ) = ctx.saved_tensors
         width = ctx.width
         height = ctx.height
         tile_size = ctx.tile_size

@@ -284,23 +284,25 @@ __device__ void grad_covariance(
     };
 
     // dE'_inv/dE'
-    float cov_00 = cov_image[0];
-    float cov_01 = cov_image[1];
-    float cov_11 = cov_image[2];
-    float inv_det = 1.0f / (cov_00 * cov_11 - cov_01 * cov_01);
+    float a = cov_image[0];
+    float b = cov_image[1];
+    float c = cov_image[2];
+    float det = a * c - b * b;
+    float inv_det = 1.0f / det;
     float inv_det2 = inv_det * inv_det;
-    float trace = cov_00 + cov_11 - 2.0f * cov_01;
-    float dEpi_dEp[3] = {
-        inv_det - cov_11 * trace * inv_det2,
-        2.0f * (-inv_det + cov_01 * trace * inv_det2),
-        inv_det - cov_00 * trace * inv_det2,
+    float dEpi_dEp[3][3] = {
+        {-c * c * inv_det2, b * c * inv_det2, -b * b * inv_det2},
+        {2.0f * b * c * inv_det2, -(a * c + b * b) * inv_det2, 2.0f * a * b * inv_det2},
+        {-b * b * inv_det2, a * b * inv_det2, -a * a * inv_det2}
     };
 
-    float grad_Ep[3] = {
-        grad_cov_inv_image[0] * dEpi_dEp[0],
-        grad_cov_inv_image[1] * dEpi_dEp[1],
-        grad_cov_inv_image[2] * dEpi_dEp[2]
-    };
+    float grad_Ep[3];
+    for (int i = 0; i < 3; i++) {
+        grad_Ep[i] = 0.0f;
+        for (int j = 0; j < 3; j++) {
+            grad_Ep[i] += grad_cov_inv_image[j] * dEpi_dEp[i][j];
+        }
+    }
 
     float grad_E[9];
     for (int i = 0; i < 9; i++) {
@@ -543,6 +545,7 @@ __global__ void evaluate_spherical_harmonics_backward_kernel(
     const float *points_world,  // (N*3,)
     const float *sh_coeffs_dc,  // (N*3,)
     const float *sh_coeffs_rest,  // (N*15*3,)
+    const float *colors,  // (N*3,)
     const bool *mask,  // (N,)
     float *grad_points_world,  // (N*3,)
     float *grad_sh_coeffs_dc,  // (N*3,)
@@ -589,69 +592,74 @@ __global__ void evaluate_spherical_harmonics_backward_kernel(
         SH_C3_xxx_xyy * x * (xx - 3 * yy),
     };
 
-    // compute local gradients w.r.t. point
-    float grad_px = (norm * norm - dx * dx) * inv_norm * inv_norm * inv_norm;
-    float grad_py = (norm * norm - dy * dy) * inv_norm * inv_norm * inv_norm;
-    float grad_pz = (norm * norm - dz * dz) * inv_norm * inv_norm * inv_norm;
-    float grad_pxx = 2 * x * grad_px;
-    float grad_pyy = 2 * y * grad_py;
-    float grad_pzz = 2 * z * grad_pz;
-    float grad_sh_rest_px[15] = {
+    // compute local gradients w.r.t. normalized viewing direction
+    float dbasis_dx[15] = {
         0.0f,
         0.0f,
-        -SH_C1_x * grad_px,
-        SH_C2_xy * y * grad_px,
+        -SH_C1_x,
+        SH_C2_xy * y,
         0.0f,
         0.0f,
-        SH_C2_xz * z * grad_px,
-        SH_C2_xx_yy * grad_pxx,
-        SH_C3_yxx_yyy * y * grad_pxx,
-        SH_C3_xyz * y * z * grad_px,
-        SH_C3_yzz_yxx_yyy * y * (- grad_pxx),
-        SH_C3_zzz_zxx_zyy * z * (-3 * grad_pxx),
-        SH_C3_xzz_xxx_xyy * (x * (-grad_pxx) + grad_px * (4 * zz - xx - yy)),
-        SH_C3_zxx_zyy * z * grad_pxx,
-        SH_C3_xxx_xyy * (x * grad_pxx + grad_px * (xx - 3 * yy)),
+        SH_C2_xz * z,
+        2.0f * SH_C2_xx_yy * x,
+        2.0f * SH_C3_yxx_yyy * x * y,
+        SH_C3_xyz * y * z,
+        -2.0f * SH_C3_yzz_yxx_yyy * x * y,
+        -6.0f * SH_C3_zzz_zxx_zyy * x * z,
+        SH_C3_xzz_xxx_xyy * (4.0f * zz - 3.0f * xx - yy),
+        2.0f * SH_C3_zxx_zyy * x * z,
+        3.0f * SH_C3_xxx_xyy * (xx - yy),
     };
-    float grad_sh_rest_py[15] = {
-        -SH_C1_y * grad_py,
+    float dbasis_dy[15] = {
+        -SH_C1_y,
         0.0f,
         0.0f,
-        SH_C2_xy * x * grad_py,
-        SH_C2_yz * z * grad_py,
+        SH_C2_xy * x,
+        SH_C2_yz * z,
         0.0f,
         0.0f,
-        SH_C2_xx_yy * (-grad_pyy),
-        SH_C3_yxx_yyy * (grad_py * (xx - yy) + y * (-grad_pyy)),
-        SH_C3_xyz * x * z * grad_py,
-        SH_C3_yzz_yxx_yyy * (grad_py * (4 * zz - xx - yy) + y * (-grad_pyy)),
-        SH_C3_zzz_zxx_zyy * z * (-3 * grad_pyy),
-        SH_C3_xzz_xxx_xyy * x * (-grad_pyy),
-        SH_C3_zxx_zyy * z * (-grad_pyy),
-        SH_C3_xxx_xyy * x * (-3 * grad_pyy),
+        -2.0f * SH_C2_xx_yy * y,
+        SH_C3_yxx_yyy * (xx - 3.0f * yy),
+        SH_C3_xyz * x * z,
+        SH_C3_yzz_yxx_yyy * (4.0f * zz - xx - 3.0f * yy),
+        -6.0f * SH_C3_zzz_zxx_zyy * y * z,
+        -2.0f * SH_C3_xzz_xxx_xyy * x * y,
+        -2.0f * SH_C3_zxx_zyy * y * z,
+        -6.0f * SH_C3_xxx_xyy * x * y,
     };
-    float grad_sh_rest_pz[15] = {
+    float dbasis_dz[15] = {
         0.0f,
-        SH_C1_z * grad_pz,
-        0.0f,
-        0.0f,
-        SH_C2_yz * y * grad_pz,
-        SH_C2_zz * 3 * grad_pzz,
-        SH_C2_xz * x * grad_pz,
+        SH_C1_z,
         0.0f,
         0.0f,
-        SH_C3_xyz * x * y * grad_pz,
-        SH_C3_yzz_yxx_yyy * y * (4 * grad_pzz),
-        SH_C3_zzz_zxx_zyy * (grad_pz * (2 * zz - 3 * xx - 3 * yy) + z * (2 * grad_pzz)),
-        SH_C3_xzz_xxx_xyy * x * (4 * grad_pzz),
-        SH_C3_zxx_zyy * grad_pz * (xx - yy),
+        SH_C2_yz * y,
+        6.0f * SH_C2_zz * z,
+        SH_C2_xz * x,
+        0.0f,
+        0.0f,
+        SH_C3_xyz * x * y,
+        8.0f * SH_C3_yzz_yxx_yyy * y * z,
+        3.0f * SH_C3_zzz_zxx_zyy * (2.0f * zz - xx - yy),
+        8.0f * SH_C3_xzz_xxx_xyy * x * z,
+        SH_C3_zxx_zyy * (xx - yy),
         0.0f,
     };
 
+    // Jacobian of normalized direction v = d / ||d|| w.r.t. world position
+    float j00 = (1.0f - xx) * inv_norm;
+    float j01 = -xy * inv_norm;
+    float j02 = -xz * inv_norm;
+    float j10 = -xy * inv_norm;
+    float j11 = (1.0f - yy) * inv_norm;
+    float j12 = -yz * inv_norm;
+    float j20 = -xz * inv_norm;
+    float j21 = -yz * inv_norm;
+    float j22 = (1.0f - zz) * inv_norm;
+
     // compute sigmoid gradient
-    float grad_r = grad_colors[idx*3] * (1.0f - grad_colors[idx*3]);
-    float grad_g = grad_colors[idx*3 + 1] * (1.0f - grad_colors[idx*3 + 1]);
-    float grad_b = grad_colors[idx*3 + 2] * (1.0f - grad_colors[idx*3 + 2]);
+    float grad_r = colors[idx*3] * (1.0f - colors[idx*3]) * grad_colors[idx*3];
+    float grad_g = colors[idx*3 + 1] * (1.0f - colors[idx*3 + 1]) * grad_colors[idx*3 + 1];
+    float grad_b = colors[idx*3 + 2] * (1.0f - colors[idx*3 + 2]) * grad_colors[idx*3 + 2];
 
     // compute gradient w.r.t. sh_coeffs_dc
     grad_sh_coeffs_dc[idx*3] = grad_r * sh_basis[0];
@@ -670,15 +678,19 @@ __global__ void evaluate_spherical_harmonics_backward_kernel(
     float grad_y = 0.0f;
     float grad_z = 0.0f;
     for (int i = 0; i < 15; ++i) {
-        grad_x += grad_r * sh_coeffs_rest[(idx*15 + i)*3] * grad_sh_rest_px[i] +
-                  grad_g * sh_coeffs_rest[(idx*15 + i)*3 + 1] * grad_sh_rest_px[i] +
-                  grad_b * sh_coeffs_rest[(idx*15 + i)*3 + 2] * grad_sh_rest_px[i];
-        grad_y += grad_r * sh_coeffs_rest[(idx*15 + i)*3] * grad_sh_rest_py[i] +
-                  grad_g * sh_coeffs_rest[(idx*15 + i)*3 + 1] * grad_sh_rest_py[i] +
-                  grad_b * sh_coeffs_rest[(idx*15 + i)*3 + 2] * grad_sh_rest_py[i];
-        grad_z += grad_r * sh_coeffs_rest[(idx*15 + i)*3] * grad_sh_rest_pz[i] +
-                  grad_g * sh_coeffs_rest[(idx*15 + i)*3 + 1] * grad_sh_rest_pz[i] +
-                  grad_b * sh_coeffs_rest[(idx*15 + i)*3 + 2] * grad_sh_rest_pz[i];
+        float grad_basis_px = dbasis_dx[i] * j00 + dbasis_dy[i] * j10 + dbasis_dz[i] * j20;
+        float grad_basis_py = dbasis_dx[i] * j01 + dbasis_dy[i] * j11 + dbasis_dz[i] * j21;
+        float grad_basis_pz = dbasis_dx[i] * j02 + dbasis_dy[i] * j12 + dbasis_dz[i] * j22;
+
+        grad_x += grad_r * sh_coeffs_rest[(idx*15 + i)*3] * grad_basis_px +
+                  grad_g * sh_coeffs_rest[(idx*15 + i)*3 + 1] * grad_basis_px +
+                  grad_b * sh_coeffs_rest[(idx*15 + i)*3 + 2] * grad_basis_px;
+        grad_y += grad_r * sh_coeffs_rest[(idx*15 + i)*3] * grad_basis_py +
+                  grad_g * sh_coeffs_rest[(idx*15 + i)*3 + 1] * grad_basis_py +
+                  grad_b * sh_coeffs_rest[(idx*15 + i)*3 + 2] * grad_basis_py;
+        grad_z += grad_r * sh_coeffs_rest[(idx*15 + i)*3] * grad_basis_pz +
+                  grad_g * sh_coeffs_rest[(idx*15 + i)*3 + 1] * grad_basis_pz +
+                  grad_b * sh_coeffs_rest[(idx*15 + i)*3 + 2] * grad_basis_pz;
     }
     grad_points_world[idx*3] = grad_x;
     grad_points_world[idx*3 + 1] = grad_y;
@@ -918,48 +930,82 @@ __global__ void rasterize_backward_kernel(
     float grad_r = grad_output_image[(v * width + u) * 3];
     float grad_g = grad_output_image[(v * width + u) * 3 + 1];
     float grad_b = grad_output_image[(v * width + u) * 3 + 2];
-    
-    float transmittance = 1.0f;
+
+    float c_transmittance = 1.0f;
     int32_t range_start = indexing_offset[tile_id];
     int32_t range_end = (tile_id + 1 < unique_tiles) ? indexing_offset[tile_id+1] : total_tiles;
     for (int32_t i = range_start; i < range_end; ++i) {
-        int32_t gaussian_id = gaussian_ids_sorted[i];
-        float du = u - points_image[gaussian_id*2];
-        float dv = v - points_image[gaussian_id*2 + 1];
-        float inv_cov_00 = cov_inv_image[gaussian_id*3];
-        float inv_cov_01 = cov_inv_image[gaussian_id*3 + 1];
-        float inv_cov_11 = cov_inv_image[gaussian_id*3 + 2];
+        // current gaussian
+        int32_t c_id = gaussian_ids_sorted[i];
+        float c_du = u - points_image[c_id*2];
+        float c_dv = v - points_image[c_id*2 + 1];
+        float c_inv_cov_00 = cov_inv_image[c_id*3];
+        float c_inv_cov_01 = cov_inv_image[c_id*3 + 1];
+        float c_inv_cov_11 = cov_inv_image[c_id*3 + 2];
 
-        float exponent = inv_cov_00 * du * du + 2.0f * inv_cov_01 * du * dv + inv_cov_11 * dv * dv;
+        float exponent = c_inv_cov_00 * c_du * c_du + 2.0f * c_inv_cov_01 * c_du * c_dv + c_inv_cov_11 * c_dv * c_dv;
         if (exponent > chi_squared_threshold) {
             continue;
         }
-        float density = expf(-0.5f * exponent);
-        float alpha = density * opacities[gaussian_id];
-        if (alpha < alpha_threshold) {
+
+        float c_density = expf(-0.5f * exponent);
+        float c_alpha = c_density * opacities[c_id];
+        if (c_alpha < alpha_threshold) {
             continue;
         }
-        float weight = alpha * transmittance;
 
-        // compute gradient w.r.t. colors
-        atomicAdd(&grad_colors[gaussian_id*3], weight * grad_r);
-        atomicAdd(&grad_colors[gaussian_id*3 + 1], weight * grad_g);
-        atomicAdd(&grad_colors[gaussian_id*3 + 2], weight * grad_b);
+        float c_weight = c_alpha * c_transmittance;
+        float c_grad_u = c_inv_cov_00 * c_du + c_inv_cov_01 * c_dv;
+        float c_grad_v = c_inv_cov_01 * c_du + c_inv_cov_11 * c_dv;
+        float c_grad_rgb = grad_r * colors[c_id*3] + grad_g * colors[c_id*3 + 1] + grad_b * colors[c_id*3 + 2];
 
-        // compute gradient w.r.t. opacity
-        atomicAdd(&grad_opacities[gaussian_id], density * transmittance * (grad_r + grad_g + grad_b));
+        atomicAdd(&grad_colors[c_id*3], c_weight * grad_r);
+        atomicAdd(&grad_colors[c_id*3 + 1], c_weight * grad_g);
+        atomicAdd(&grad_colors[c_id*3 + 2], c_weight * grad_b);
+        atomicAdd(&grad_opacities[c_id], c_density * c_transmittance * c_grad_rgb);
+        atomicAdd(&grad_points_image[c_id*2], c_grad_u * c_weight * c_grad_rgb);
+        atomicAdd(&grad_points_image[c_id*2 + 1], c_grad_v * c_weight * c_grad_rgb);
+        atomicAdd(&grad_cov_inv_image[c_id*3], -0.5f * c_du * c_du * c_weight * c_grad_rgb);
+        atomicAdd(&grad_cov_inv_image[c_id*3 + 1], -c_du * c_dv * c_weight * c_grad_rgb);
+        atomicAdd(&grad_cov_inv_image[c_id*3 + 2], -0.5f * c_dv * c_dv * c_weight * c_grad_rgb);  
 
-        // compute gradients w.r.t. points_image
-        atomicAdd(&grad_points_image[gaussian_id*2], weight * (inv_cov_00 * du + inv_cov_01 * dv));
-        atomicAdd(&grad_points_image[gaussian_id*2 + 1], weight * (inv_cov_01 * du + inv_cov_11 * dv));
+        // farther gaussians
+        float f_transmittance = c_transmittance * (1.0f - c_alpha);
+        for (int j = i + 1; j < range_end; ++j) {
+            int32_t f_id = gaussian_ids_sorted[j];
+            float f_du = u - points_image[f_id*2];
+            float f_dv = v - points_image[f_id*2 + 1];
+            float f_inv_cov_00 = cov_inv_image[f_id*3];
+            float f_inv_cov_01 = cov_inv_image[f_id*3 + 1];
+            float f_inv_cov_11 = cov_inv_image[f_id*3 + 2];
 
-        // compute gradients w.r.t. cov_inv_image
-        atomicAdd(&grad_cov_inv_image[gaussian_id*3], weight * (-0.5f * du * du));
-        atomicAdd(&grad_cov_inv_image[gaussian_id*3 + 1], weight * (-du * dv));
-        atomicAdd(&grad_cov_inv_image[gaussian_id*3 + 2], weight * (-0.5f * dv * dv));
+            exponent = f_inv_cov_00 * f_du * f_du + 2.0f * f_inv_cov_01 * f_du * f_dv + f_inv_cov_11 * f_dv * f_dv;
+            if (exponent > chi_squared_threshold) {
+                continue;
+            }
 
-        transmittance *= (1.0f - alpha);
-        if (transmittance < transmittance_threshold) {
+            float f_alpha = expf(-0.5f * exponent) * opacities[f_id];
+            if (f_alpha < alpha_threshold) {
+                continue;
+            }
+
+            float f_grad_rgb = grad_r * colors[f_id*3] + grad_g * colors[f_id*3 + 1] + grad_b * colors[f_id*3 + 2];
+            float factor = -f_alpha * f_transmittance * f_grad_rgb / (1 - c_alpha + 1e-8f);
+            atomicAdd(&grad_opacities[c_id], c_density * factor);
+            atomicAdd(&grad_points_image[c_id*2], c_grad_u * c_alpha * factor);
+            atomicAdd(&grad_points_image[c_id*2 + 1], c_grad_v * c_alpha * factor);
+            atomicAdd(&grad_cov_inv_image[c_id*3], -0.5f * c_du * c_du * c_alpha * factor);
+            atomicAdd(&grad_cov_inv_image[c_id*3 + 1], -c_du * c_dv * c_alpha * factor);
+            atomicAdd(&grad_cov_inv_image[c_id*3 + 2], -0.5f * c_dv * c_dv * c_alpha * factor);
+
+            f_transmittance *= (1.0f - f_alpha);
+            if (f_transmittance < transmittance_threshold) {
+                break;
+            }
+        }
+
+        c_transmittance *= (1.0f - c_alpha);
+        if (c_transmittance < transmittance_threshold) {
             break;
         }
     }
@@ -1092,6 +1138,7 @@ void launch_evaluate_spherical_harmonics_backward_kernel(
     const torch::Tensor points_world,
     const torch::Tensor sh_coeffs_dc,
     const torch::Tensor sh_coeffs_rest,
+    const torch::Tensor colors,
     const torch::Tensor mask,
     torch::Tensor grad_points_world,
     torch::Tensor grad_sh_coeffs_dc,
@@ -1111,6 +1158,7 @@ void launch_evaluate_spherical_harmonics_backward_kernel(
         points_world.data_ptr<float>(),
         sh_coeffs_dc.data_ptr<float>(),
         sh_coeffs_rest.data_ptr<float>(),
+        colors.data_ptr<float>(),
         mask.data_ptr<bool>(),
         grad_points_world.data_ptr<float>(),
         grad_sh_coeffs_dc.data_ptr<float>(),

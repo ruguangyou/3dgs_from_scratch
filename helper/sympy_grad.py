@@ -1,13 +1,42 @@
 from sympy import symbols, diff, sqrt, exp, simplify, MatrixSymbol
 
-# # view direction in SH
-# xp, yp, zp, xc, yc, zc, n = symbols("xp yp zp xc yc zc n")
-# n = sqrt((xp - xc) ** 2 + (yp - yc) ** 2 + (zp - zc) ** 2)
-# f = (xp - xc) / n
-# grad_xp = diff(f, xp)
-# print("grad_xp:", simplify(grad_xp))
-# grad_xc = diff(f, xc)
-# print("grad_xc:", simplify(grad_xc))
+# view direction in SH
+xp, yp, zp, xc, yc, zc, n = symbols("xp yp zp xt yt zt n")
+dx, dy, dz = symbols("dx dy dz")
+n, n2, x, y, z = symbols("n n2 x y z")
+dx, dy, dz = xp - xc, yp - yc, zp - zc
+n = sqrt(dx ** 2 + dy ** 2 + dz ** 2)
+x, y, z = dx / n, dy / n, dz / n
+
+subs_map = {
+    xp - xc: dx,
+    yp - yc: dy,
+    zp - zc: dz,
+    (xp - xc) ** 2 + (yp - yc) ** 2 + (zp - zc) ** 2: n2,
+}
+
+for i, e in [
+    ("-SH_C1_y", y),
+    ("SH_C1_z", z),
+    ("-SH_C1_x", x),
+    ("SH_C2_xy", x * y),
+    ("SH_C2_yz", y * z),
+    ("SH_C2_zz", 3 * z**2 - 1),
+    ("SH_C2_xz", x * z),
+    ("SH_C2_xx_yy", x**2 - y**2),
+    ("SH_C3_yxx_yyy", y * (x**2 - y**2)),
+    ("SH_C3_xyz", x * y * z),
+    ("SH_C3_yzz_yxx_yyy", y * (4 * z**2 - x**2 - y**2)),
+    ("SH_C3_zzz_zxx_zyy", z * (4 * z**2 - 3 * x**2 - 3 * y**2)),
+    ("SH_C3_xzz_xxx_xyy", x * (4 * z**2 - x**2 - y**2)),
+    ("SH_C3_zxx_zyy", z * (x**2 - y**2)),
+    ("SH_C3_xxx_xyy", x * (x**2 - 3 * y**2)),
+]:
+    print(i)
+    print("grad_xp:", simplify(diff(e, xp)).xreplace(subs_map))
+    print("grad_yp:", simplify(diff(e, yp)).xreplace(subs_map))
+    print("grad_zp:", simplify(diff(e, zp)).xreplace(subs_map))
+    print()
 
 # # alpha blending
 # u, v, x, y, inv_cov_xx, inv_cov_yy, inv_cov_xy = symbols(
@@ -47,17 +76,19 @@ from sympy import symbols, diff, sqrt, exp, simplify, MatrixSymbol
 # grad_zw = diff(a, zw)
 # print("grad_zw:", simplify(grad_zw))
 
-# project covariance
-cov_00, cov_01, cov_11 = symbols("cov_00 cov_01 cov_11")
-inv_cov_00, inv_cov_01, inv_cov_11 = symbols("inv_cov_00 inv_cov_01 inv_cov_11")
-det = cov_00 * cov_11 - cov_01 * cov_01
-inv_cov_00 = cov_11 / det
-inv_cov_11 = cov_00 / det
-inv_cov_01 = -cov_01 / det
-inv_cov = inv_cov_00 + inv_cov_11 + 2 * inv_cov_01
-grad_cov_00 = diff(inv_cov, cov_00)
-print("grad_cov_00:", simplify(grad_cov_00))
-grad_cov_01 = diff(inv_cov, cov_01)
-print("grad_cov_01:", simplify(grad_cov_01))
-grad_cov_11 = diff(inv_cov, cov_11)
-print("grad_cov_11:", simplify(grad_cov_11))
+# # project covariance
+# cov_00, cov_01, cov_11 = symbols("a b c")
+# inv_cov_00, inv_cov_01, inv_cov_11 = symbols("inv_a inv_b inv_c")
+# det = cov_00 * cov_11 - cov_01 * cov_01
+# inv_cov_00 = cov_11 / det
+# inv_cov_11 = cov_00 / det
+# inv_cov_01 = -cov_01 / det
+# print("diff(inv_cov_00, cov_00):", simplify(diff(inv_cov_00, cov_00)))
+# print("diff(inv_cov_01, cov_00):", simplify(diff(inv_cov_01, cov_00)))
+# print("diff(inv_cov_11, cov_00):", simplify(diff(inv_cov_11, cov_00)))
+# print("diff(inv_cov_00, cov_01):", simplify(diff(inv_cov_00, cov_01)))
+# print("diff(inv_cov_01, cov_01):", simplify(diff(inv_cov_01, cov_01)))
+# print("diff(inv_cov_11, cov_11):", simplify(diff(inv_cov_11, cov_11)))
+# print("diff(inv_cov_00, cov_11):", simplify(diff(inv_cov_00, cov_11)))
+# print("diff(inv_cov_01, cov_11):", simplify(diff(inv_cov_01, cov_11)))
+# print("diff(inv_cov_11, cov_11):", simplify(diff(inv_cov_11, cov_11)))
