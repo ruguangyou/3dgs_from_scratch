@@ -267,7 +267,7 @@ __device__ void grad_projection_and_covariance(
     float b = cov_image[1];
     float c = cov_image[2];
     float det = a * c - b * b;
-    float inv_det = 1.0f / det;
+    float inv_det = 1.0f / fmaxf(det, 1e-12f);
     float inv_det2 = inv_det * inv_det;
     float dEpi_dEp[3][3] = {
         {-c * c * inv_det2, b * c * inv_det2, -b * b * inv_det2},
@@ -438,16 +438,12 @@ __global__ void project_points_kernel(
 
     // compute inverse of covariance in image space
     float det = cov_image[idx*3] * cov_image[idx*3 + 2] - cov_image[idx*3 + 1] * cov_image[idx*3 + 1];
-    if (det <= 1e-5f) {
-        mask[idx] = false;
-        return;
-    }
-    float inv_det = 1.0f / det;
+    float inv_det = 1.0f / fmaxf(det, 1e-12f);
 
     // compute radius in image space
     float extend = 3.0f;  // 3-sigma
-    float radius_u = ceilf(extend * sqrtf(cov_image[idx*3]));
-    float radius_v = ceilf(extend * sqrtf(cov_image[idx*3 + 2]));
+    float radius_u = fmaxf(sqrtf(cov_image[idx*3]), 1e-12f) * extend;
+    float radius_v = fmaxf(sqrtf(cov_image[idx*3 + 2]), 1e-12f) * extend;
     float radius = fmaxf(radius_u, radius_v);
 
     // mask out points with too small or too large radius in image space
@@ -937,10 +933,9 @@ __global__ void rasterize_kernel(
         }
     }
 
-    // clamp output color to [0, 1]
-    output_image[(v * width + u) * 3] = fminf(fmaxf(r, 0.0f), 1.0f);
-    output_image[(v * width + u) * 3 + 1] = fminf(fmaxf(g, 0.0f), 1.0f);
-    output_image[(v * width + u) * 3 + 2] = fminf(fmaxf(b, 0.0f), 1.0f);
+    output_image[(v * width + u) * 3] = r;
+    output_image[(v * width + u) * 3 + 1] = g;
+    output_image[(v * width + u) * 3 + 2] = b;
 }
 
 __global__ void rasterize_backward_kernel(

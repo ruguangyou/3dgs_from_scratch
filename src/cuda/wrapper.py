@@ -272,4 +272,5 @@ def render(
         chi_squared_threshold,
     )
 
-    return rendered_image * 255  # scale to [0, 255]
+    # clamp to [0, 1] before scaling
+    return rendered_image.clamp(0, 1) * 255
