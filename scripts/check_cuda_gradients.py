@@ -41,6 +41,143 @@ def check_result(tag: str, values: list[tuple[str, float, float]], thresholds: T
     return success
 
 
+def build_reference_tile_layout(
+    points_img: torch.Tensor,
+    radii: torch.Tensor,
+    depths: torch.Tensor,
+    mask: torch.Tensor,
+    width: int,
+    height: int,
+    tile_size: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    num_tiles_per_row = (width + tile_size - 1) // tile_size
+    num_tiles_per_col = (height + tile_size - 1) // tile_size
+    unique_tiles = num_tiles_per_row * num_tiles_per_col
+
+    entries: list[tuple[int, int, int]] = []
+    for gaussian_id in range(points_img.shape[0]):
+        if not bool(mask[gaussian_id].item()):
+            continue
+
+        u = float(points_img[gaussian_id, 0].item())
+        v = float(points_img[gaussian_id, 1].item())
+        radius_u = float(radii[gaussian_id, 0].item())
+        radius_v = float(radii[gaussian_id, 1].item())
+
+        u_min = min(max(0, int(torch.floor(torch.tensor(u - radius_u)).item())), width - 1)
+        u_max = min(max(0, int(torch.floor(torch.tensor(u + radius_u)).item())), width - 1)
+        v_min = min(max(0, int(torch.floor(torch.tensor(v - radius_v)).item())), height - 1)
+        v_max = min(max(0, int(torch.floor(torch.tensor(v + radius_v)).item())), height - 1)
+        if u_min > u_max or v_min > v_max:
+            continue
+
+        tile_u_min = u_min // tile_size
+        tile_u_max = u_max // tile_size
+        tile_v_min = v_min // tile_size
+        tile_v_max = v_max // tile_size
+        depth_bits = depths[gaussian_id : gaussian_id + 1].detach().view(torch.int32).item() & 0xFFFFFFFF
+
+        for tile_v in range(tile_v_min, tile_v_max + 1):
+            for tile_u in range(tile_u_min, tile_u_max + 1):
+                tile_id = tile_v * num_tiles_per_row + tile_u
+                entries.append((tile_id, depth_bits, gaussian_id))
+
+    entries.sort(key=lambda item: (item[0], item[1]))
+    total_tiles = len(entries)
+    gaussian_ids_sorted = torch.tensor(
+        [gaussian_id for _, _, gaussian_id in entries],
+        dtype=torch.int32,
+        device=points_img.device,
+    )
+    indexing_offset = torch.full(
+        (unique_tiles,),
+        total_tiles,
+        dtype=torch.int32,
+        device=points_img.device,
+    )
+
+    if total_tiles == 0:
+        indexing_offset.zero_()
+        return indexing_offset, gaussian_ids_sorted
+
+    previous_tile_id: int | None = None
+    for idx, (tile_id, _, _) in enumerate(entries):
+        if previous_tile_id is None:
+            indexing_offset[: tile_id + 1] = 0
+            previous_tile_id = tile_id
+            continue
+        if tile_id != previous_tile_id:
+            indexing_offset[previous_tile_id + 1 : tile_id + 1] = idx
+            previous_tile_id = tile_id
+
+    if previous_tile_id is not None:
+        indexing_offset[previous_tile_id + 1 :] = total_tiles
+
+    return indexing_offset, gaussian_ids_sorted
+
+
+def rasterize_reference(
+    indexing_offset: torch.Tensor,
+    gaussian_ids_sorted: torch.Tensor,
+    points_img: torch.Tensor,
+    cov_inv_img: torch.Tensor,
+    opacities: torch.Tensor,
+    colors: torch.Tensor,
+    width: int,
+    height: int,
+    tile_size: int,
+    alpha_threshold: float,
+    transmittance_threshold: float,
+    chi_squared_threshold: float,
+) -> torch.Tensor:
+    unique_tiles = indexing_offset.shape[0]
+    total_tiles = gaussian_ids_sorted.shape[0]
+    num_tiles_per_row = (width + tile_size - 1) // tile_size
+    reference = torch.zeros((height, width, 3), device=points_img.device, dtype=points_img.dtype)
+
+    for tile_id in range(unique_tiles):
+        row = tile_id // num_tiles_per_row
+        col = tile_id % num_tiles_per_row
+        range_start = indexing_offset[tile_id].item()
+        range_end = (
+            indexing_offset[tile_id + 1].item() if tile_id + 1 < unique_tiles else total_tiles
+        )
+
+        for idx_in_tile in range(tile_size * tile_size):
+            u = col * tile_size + (idx_in_tile % tile_size)
+            v = row * tile_size + (idx_in_tile // tile_size)
+            if u >= width or v >= height:
+                continue
+
+            transmittance = torch.tensor(1.0, device=points_img.device, dtype=points_img.dtype)
+            pixel = torch.zeros(3, device=points_img.device, dtype=points_img.dtype)
+            for gaussian_index in range(range_start, range_end):
+                gaussian_id = gaussian_ids_sorted[gaussian_index]
+                du = u - points_img[gaussian_id, 0]
+                dv = v - points_img[gaussian_id, 1]
+                inv_cov_00 = cov_inv_img[gaussian_id, 0]
+                inv_cov_01 = cov_inv_img[gaussian_id, 1]
+                inv_cov_11 = cov_inv_img[gaussian_id, 2]
+
+                exponent = inv_cov_00 * du * du + 2.0 * inv_cov_01 * du * dv + inv_cov_11 * dv * dv
+                if exponent.item() > chi_squared_threshold:
+                    continue
+
+                alpha = torch.exp(-0.5 * exponent) * opacities[gaussian_id]
+                if alpha.item() < alpha_threshold:
+                    continue
+
+                weight = alpha * transmittance
+                pixel = pixel + weight * colors[gaussian_id]
+                transmittance = transmittance * (1.0 - alpha)
+                if transmittance.item() < transmittance_threshold:
+                    break
+
+            reference[v, u] = pixel
+
+    return reference
+
+
 def check_project_points(seed: int, device: str, thresholds: Thresholds) -> bool:
     torch.manual_seed(seed)
     count = 256
@@ -223,49 +360,20 @@ def check_rasterize(seed: int, device: str, thresholds: Thresholds) -> bool:
         )
     )
 
-    unique_tiles = indexing_offset.shape[0]
-    total_tiles = gaussian_ids_sorted.shape[0]
-    num_tiles_per_row = (width + tile_size - 1) // tile_size
-    reference = torch.zeros((height, width, 3), device=device, dtype=points_img.dtype)
-    for tile_id in range(unique_tiles):
-        row = tile_id // num_tiles_per_row
-        col = tile_id % num_tiles_per_row
-        range_start = indexing_offset[tile_id].item()
-        range_end = (
-            indexing_offset[tile_id + 1].item() if tile_id + 1 < unique_tiles else total_tiles
-        )
-
-        for idx_in_tile in range(tile_size * tile_size):
-            u = col * tile_size + (idx_in_tile % tile_size)
-            v = row * tile_size + (idx_in_tile // tile_size)
-            if u >= width or v >= height:
-                continue
-
-            transmittance = torch.tensor(1.0, device=device, dtype=points_img.dtype)
-            pixel = torch.zeros(3, device=device, dtype=points_img.dtype)
-            for gaussian_index in range(range_start, range_end):
-                gaussian_id = gaussian_ids_sorted[gaussian_index]
-                du = u - points_img[gaussian_id, 0]
-                dv = v - points_img[gaussian_id, 1]
-                inv_cov_00 = cov_inv_img[gaussian_id, 0]
-                inv_cov_01 = cov_inv_img[gaussian_id, 1]
-                inv_cov_11 = cov_inv_img[gaussian_id, 2]
-
-                exponent = inv_cov_00 * du * du + 2.0 * inv_cov_01 * du * dv + inv_cov_11 * dv * dv
-                if exponent.item() > chi_squared_threshold:
-                    continue
-
-                alpha = torch.exp(-0.5 * exponent) * opacities[gaussian_id]
-                if alpha.item() < alpha_threshold:
-                    continue
-
-                weight = alpha * transmittance
-                pixel = pixel + weight * colors[gaussian_id]
-                transmittance = transmittance * (1.0 - alpha)
-                if transmittance.item() < transmittance_threshold:
-                    break
-
-            reference[v, u] = pixel
+    reference = rasterize_reference(
+        indexing_offset,
+        gaussian_ids_sorted,
+        points_img,
+        cov_inv_img,
+        opacities,
+        colors,
+        width,
+        height,
+        tile_size,
+        alpha_threshold,
+        transmittance_threshold,
+        chi_squared_threshold,
+    )
 
     loss = (reference * upstream).sum()
     grad_points_ref, grad_cov_ref, grad_opacities_ref, grad_colors_ref = torch.autograd.grad(
@@ -282,6 +390,344 @@ def check_rasterize(seed: int, device: str, thresholds: Thresholds) -> bool:
         metric("colors", grad_colors_cuda, grad_colors_ref),
     ]
     return check_result("rasterize", values, thresholds)
+
+
+def check_rasterize_multitile(seed: int, device: str, thresholds: Thresholds) -> bool:
+    torch.manual_seed(seed)
+    width, height = 48, 48
+    tile_size = 16
+
+    points_base = torch.tensor(
+        [
+            [15.5, 15.5],
+            [16.2, 15.8],
+            [31.2, 7.5],
+            [7.5, 31.2],
+            [39.0, 39.0],
+        ],
+        device=device,
+        dtype=torch.float32,
+    )
+    radii = torch.tensor(
+        [
+            [10.5, 10.5],
+            [9.8, 9.2],
+            [8.4, 7.6],
+            [7.6, 8.8],
+            [4.5, 4.5],
+        ],
+        device=device,
+        dtype=torch.float32,
+    )
+    depths = torch.tensor([0.55, 0.62, 0.28, 0.91, 0.18], device=device, dtype=torch.float32)
+    mask = torch.ones(points_base.shape[0], device=device, dtype=torch.bool)
+
+    points_img = points_base.detach().clone().requires_grad_(True)
+    cov_inv_img = torch.tensor(
+        [
+            [0.085, 0.012, 0.072],
+            [0.078, -0.009, 0.088],
+            [0.094, 0.004, 0.109],
+            [0.103, -0.006, 0.091],
+            [0.162, 0.000, 0.149],
+        ],
+        device=device,
+        dtype=torch.float32,
+    ).detach().requires_grad_(True)
+    opacities = torch.tensor(
+        [0.82, 0.67, 0.73, 0.58, 0.91],
+        device=device,
+        dtype=torch.float32,
+    ).detach().requires_grad_(True)
+    colors = torch.tensor(
+        [
+            [0.90, 0.25, 0.10],
+            [0.15, 0.80, 0.35],
+            [0.30, 0.40, 0.95],
+            [0.85, 0.55, 0.20],
+            [0.60, 0.75, 0.90],
+        ],
+        device=device,
+        dtype=torch.float32,
+    ).detach().requires_grad_(True)
+
+    alpha_threshold = 0.0
+    transmittance_threshold = 0.0
+    chi_squared_threshold = 9.21
+
+    indexing_offset_cuda, gaussian_ids_sorted_cuda = cuda_rasterizer.compute_tile_intersection(
+        points_img.detach(),
+        radii,
+        depths,
+        mask,
+        width,
+        height,
+        tile_size,
+    )
+    indexing_offset_ref, gaussian_ids_sorted_ref = build_reference_tile_layout(
+        points_img.detach(),
+        radii,
+        depths,
+        mask,
+        width,
+        height,
+        tile_size,
+    )
+
+    layout_ok = torch.equal(indexing_offset_cuda, indexing_offset_ref) and torch.equal(
+        gaussian_ids_sorted_cuda, gaussian_ids_sorted_ref
+    )
+    print(f"\n[rasterize_multitile_layout] match={layout_ok}")
+    if not layout_ok:
+        print(f"  indexing_offset_cuda={indexing_offset_cuda.tolist()}")
+        print(f"  indexing_offset_ref ={indexing_offset_ref.tolist()}")
+        print(f"  gaussian_ids_cuda  ={gaussian_ids_sorted_cuda.tolist()}")
+        print(f"  gaussian_ids_ref   ={gaussian_ids_sorted_ref.tolist()}")
+        return False
+
+    rendered_cuda = cuda_rasterizer.rasterize(
+        indexing_offset_cuda,
+        gaussian_ids_sorted_cuda,
+        points_img,
+        cov_inv_img,
+        opacities,
+        colors,
+        width,
+        height,
+        tile_size,
+        alpha_threshold,
+        transmittance_threshold,
+        chi_squared_threshold,
+    )
+    rendered_ref = rasterize_reference(
+        indexing_offset_ref,
+        gaussian_ids_sorted_ref,
+        points_img,
+        cov_inv_img,
+        opacities,
+        colors,
+        width,
+        height,
+        tile_size,
+        alpha_threshold,
+        transmittance_threshold,
+        chi_squared_threshold,
+    )
+
+    xs = torch.linspace(-1.0, 1.0, width, device=device, dtype=torch.float32)
+    ys = torch.linspace(-1.0, 1.0, height, device=device, dtype=torch.float32)
+    grid_y, grid_x = torch.meshgrid(ys, xs, indexing="ij")
+    upstream = torch.stack(
+        [
+            grid_x + 0.35 * grid_y,
+            -0.25 * grid_x + 0.75 * grid_y,
+            0.55 * grid_x - 0.45 * grid_y,
+        ],
+        dim=-1,
+    )
+
+    grad_points_cuda, grad_cov_cuda, grad_opacities_cuda, grad_colors_cuda = (
+        cuda_rasterizer.rasterize_backward(
+            upstream,
+            indexing_offset_cuda,
+            gaussian_ids_sorted_cuda,
+            points_img,
+            cov_inv_img,
+            opacities,
+            colors,
+            width,
+            height,
+            tile_size,
+            alpha_threshold,
+            transmittance_threshold,
+            chi_squared_threshold,
+        )
+    )
+
+    loss_ref = (rendered_ref * upstream).sum()
+    grad_points_ref, grad_cov_ref, grad_opacities_ref, grad_colors_ref = torch.autograd.grad(
+        loss_ref,
+        [points_img, cov_inv_img, opacities, colors],
+        retain_graph=False,
+        create_graph=False,
+    )
+
+    values = [
+        metric("rendered", rendered_cuda, rendered_ref),
+        metric("points_img", grad_points_cuda, grad_points_ref),
+        metric("cov_inv", grad_cov_cuda, grad_cov_ref),
+        metric("opacities", grad_opacities_cuda, grad_opacities_ref),
+        metric("colors", grad_colors_cuda, grad_colors_ref),
+    ]
+
+    threshold_overrides = {
+        "rendered": Thresholds(min_cos=0.999999, max_rel=1e-6),
+        "points_img": Thresholds(min_cos=0.999, max_rel=2e-3),
+        "cov_inv": Thresholds(min_cos=0.999, max_rel=2e-3),
+        "opacities": Thresholds(min_cos=0.99999, max_rel=1e-5),
+        "colors": Thresholds(min_cos=0.99999, max_rel=1e-5),
+    }
+    print("\n[rasterize_multitile]")
+    success = True
+    for name, cosine, rel in values:
+        custom_threshold = threshold_overrides.get(name, thresholds)
+        print(f"  {name:16s} cos={cosine:.6f} rel={rel:.6e}")
+        if cosine < custom_threshold.min_cos or rel > custom_threshold.max_rel:
+            success = False
+    return success
+
+
+def check_rasterize_multitile_truncated(seed: int, device: str, thresholds: Thresholds) -> bool:
+    torch.manual_seed(seed)
+    width, height = 48, 48
+    tile_size = 16
+    grid_u = torch.tensor([15.2, 15.9, 16.6, 17.3], device=device, dtype=torch.float32)
+    grid_v = torch.tensor([15.1, 15.8, 16.5, 17.2], device=device, dtype=torch.float32)
+    points_base = torch.cartesian_prod(grid_u, grid_v)
+    radii = torch.full((points_base.shape[0], 2), 9.8, device=device, dtype=torch.float32)
+    depths = torch.linspace(0.2, 1.0, points_base.shape[0], device=device, dtype=torch.float32)
+    mask = torch.ones(points_base.shape[0], device=device, dtype=torch.bool)
+
+    points_img = points_base.detach().clone().requires_grad_(True)
+    cov_inv_img = torch.zeros(points_base.shape[0], 3, device=device, dtype=torch.float32)
+    cov_inv_img[:, 0] = torch.linspace(0.072, 0.108, points_base.shape[0], device=device)
+    cov_inv_img[:, 1] = torch.linspace(-0.007, 0.007, points_base.shape[0], device=device)
+    cov_inv_img[:, 2] = torch.linspace(0.078, 0.115, points_base.shape[0], device=device)
+    cov_inv_img = cov_inv_img.detach().requires_grad_(True)
+    opacities = torch.linspace(0.72, 0.94, points_base.shape[0], device=device).detach().requires_grad_(True)
+    colors = torch.stack(
+        [
+            torch.linspace(0.15, 0.95, points_base.shape[0], device=device),
+            torch.linspace(0.90, 0.20, points_base.shape[0], device=device),
+            torch.linspace(0.25, 0.85, points_base.shape[0], device=device),
+        ],
+        dim=-1,
+    ).detach().requires_grad_(True)
+
+    alpha_threshold = 1e-4
+    transmittance_threshold = 1e-4
+    chi_squared_threshold = 9.21
+
+    indexing_offset_cuda, gaussian_ids_sorted_cuda = cuda_rasterizer.compute_tile_intersection(
+        points_img.detach(),
+        radii,
+        depths,
+        mask,
+        width,
+        height,
+        tile_size,
+    )
+    indexing_offset_ref, gaussian_ids_sorted_ref = build_reference_tile_layout(
+        points_img.detach(),
+        radii,
+        depths,
+        mask,
+        width,
+        height,
+        tile_size,
+    )
+
+    layout_ok = torch.equal(indexing_offset_cuda, indexing_offset_ref) and torch.equal(
+        gaussian_ids_sorted_cuda, gaussian_ids_sorted_ref
+    )
+    print(f"\n[rasterize_multitile_truncated_layout] match={layout_ok}")
+    if not layout_ok:
+        print(f"  indexing_offset_cuda={indexing_offset_cuda.tolist()}")
+        print(f"  indexing_offset_ref ={indexing_offset_ref.tolist()}")
+        print(f"  gaussian_ids_cuda  ={gaussian_ids_sorted_cuda.tolist()}")
+        print(f"  gaussian_ids_ref   ={gaussian_ids_sorted_ref.tolist()}")
+        return False
+
+    rendered_cuda = cuda_rasterizer.rasterize(
+        indexing_offset_cuda,
+        gaussian_ids_sorted_cuda,
+        points_img,
+        cov_inv_img,
+        opacities,
+        colors,
+        width,
+        height,
+        tile_size,
+        alpha_threshold,
+        transmittance_threshold,
+        chi_squared_threshold,
+    )
+    rendered_ref = rasterize_reference(
+        indexing_offset_ref,
+        gaussian_ids_sorted_ref,
+        points_img,
+        cov_inv_img,
+        opacities,
+        colors,
+        width,
+        height,
+        tile_size,
+        alpha_threshold,
+        transmittance_threshold,
+        chi_squared_threshold,
+    )
+
+    xs = torch.linspace(-1.0, 1.0, width, device=device, dtype=torch.float32)
+    ys = torch.linspace(-1.0, 1.0, height, device=device, dtype=torch.float32)
+    grid_y, grid_x = torch.meshgrid(ys, xs, indexing="ij")
+    upstream = torch.stack(
+        [
+            0.6 * grid_x + 0.4 * grid_y,
+            -0.4 * grid_x + 0.9 * grid_y,
+            0.5 * grid_x - 0.7 * grid_y,
+        ],
+        dim=-1,
+    )
+
+    grad_points_cuda, grad_cov_cuda, grad_opacities_cuda, grad_colors_cuda = (
+        cuda_rasterizer.rasterize_backward(
+            upstream,
+            indexing_offset_cuda,
+            gaussian_ids_sorted_cuda,
+            points_img,
+            cov_inv_img,
+            opacities,
+            colors,
+            width,
+            height,
+            tile_size,
+            alpha_threshold,
+            transmittance_threshold,
+            chi_squared_threshold,
+        )
+    )
+
+    loss_ref = (rendered_ref * upstream).sum()
+    grad_points_ref, grad_cov_ref, grad_opacities_ref, grad_colors_ref = torch.autograd.grad(
+        loss_ref,
+        [points_img, cov_inv_img, opacities, colors],
+        retain_graph=False,
+        create_graph=False,
+    )
+
+    values = [
+        metric("rendered", rendered_cuda, rendered_ref),
+        metric("points_img", grad_points_cuda, grad_points_ref),
+        metric("cov_inv", grad_cov_cuda, grad_cov_ref),
+        metric("opacities", grad_opacities_cuda, grad_opacities_ref),
+        metric("colors", grad_colors_cuda, grad_colors_ref),
+    ]
+
+    threshold_overrides = {
+        "rendered": Thresholds(min_cos=0.999999, max_rel=1e-6),
+        "points_img": Thresholds(min_cos=0.999, max_rel=2e-3),
+        "cov_inv": Thresholds(min_cos=0.999, max_rel=2e-3),
+        "opacities": Thresholds(min_cos=0.99999, max_rel=1e-5),
+        "colors": Thresholds(min_cos=0.99999, max_rel=1e-5),
+    }
+    print("\n[rasterize_multitile_truncated]")
+    success = True
+    for name, cosine, rel in values:
+        custom_threshold = threshold_overrides.get(name, thresholds)
+        print(f"  {name:16s} cos={cosine:.6f} rel={rel:.6e}")
+        if cosine < custom_threshold.min_cos or rel > custom_threshold.max_rel:
+            success = False
+    return success
 
 
 def check_sh(seed: int, device: str, thresholds: Thresholds) -> bool:
@@ -460,10 +906,12 @@ def check_end_to_end_real_train_loss(seed: int, device: str, thresholds: Thresho
             params["sh_coeffs_dc"],
             params["sh_coeffs_rest"],
         )
-        l1_loss = torch.nn.functional.l1_loss(rendered_image, target_image)
+        rendered_norm = rendered_image / 255.0
+        target_norm = target_image / 255.0
+        l1_loss = torch.nn.functional.l1_loss(rendered_norm, target_norm)
         ssim_loss = 1.0 - fused_ssim(
-            rendered_image.permute(2, 0, 1).unsqueeze(0),
-            target_image.permute(2, 0, 1).unsqueeze(0),
+            rendered_norm.permute(2, 0, 1).unsqueeze(0),
+            target_norm.permute(2, 0, 1).unsqueeze(0),
             padding="valid",
         )
         return 0.8 * l1_loss + 0.2 * ssim_loss
@@ -522,6 +970,8 @@ def main() -> None:
         print(f"\n===== Seed {seed} =====")
         all_ok = check_project_points(seed, args.device, thresholds) and all_ok
         all_ok = check_rasterize(seed + 100, args.device, thresholds) and all_ok
+        all_ok = check_rasterize_multitile(seed + 150, args.device, thresholds) and all_ok
+        all_ok = check_rasterize_multitile_truncated(seed + 175, args.device, thresholds) and all_ok
         all_ok = check_sh(seed + 200, args.device, thresholds) and all_ok
         all_ok = check_end_to_end(seed + 300, args.device, thresholds) and all_ok
         if not args.skip_real_train_loss:
