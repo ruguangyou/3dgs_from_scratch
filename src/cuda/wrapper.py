@@ -149,6 +149,9 @@ class RasterizeFunction(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_rendered_image):
+        # ensure contiguous layout — upstream gradients (e.g. from permute in SSIM)
+        # may have non-standard strides that CUDA kernels cannot handle
+        grad_rendered_image = grad_rendered_image.contiguous()
         (
             indexing_offset,
             gaussian_ids_sorted,
