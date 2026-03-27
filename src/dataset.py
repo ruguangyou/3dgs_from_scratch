@@ -79,10 +79,12 @@ def resize_camera(camera, image_scale: float):
         .permute(0, 2, 3, 1)
         .squeeze(0)
     )  # (1, C, H, W) -> (H, W, C)
-    camera["image"] = resized_image
-    camera["intrinsic"] *= image_scale
 
-    return camera
+    return {
+        "world_to_camera": camera["world_to_camera"],
+        "intrinsic": camera["intrinsic"] * image_scale,
+        "image": resized_image,
+    }
 
 
 class Camera:
