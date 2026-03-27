@@ -1,4 +1,5 @@
 """Diagnose gradient divergence between CUDA and torch renderers."""
+
 import pickle
 import torch
 from fused_ssim import fused_ssim
@@ -26,7 +27,7 @@ def main():
     intrinsic = sample["intrinsic"].to(device)
     target = sample["image"].to(device)
     H, W = target.shape[0], target.shape[1]
-    print(f"Image size: {W}x{H}, tiles: {(W+15)//16}x{(H+15)//16}")
+    print(f"Image size: {W}x{H}, tiles: {(W + 15) // 16}x{(H + 15) // 16}")
 
     names = ["means", "scales", "quaternions", "opacities", "sh_coeffs_dc", "sh_coeffs_rest"]
 
@@ -44,13 +45,15 @@ def main():
     # forward comparison
     p1 = clone_params()
     s1, q1, o1 = prepare(p1)
-    img_cuda = cuda_render(w2c, intrinsic, W, H, p1["means"], s1, q1, o1,
-                           p1["sh_coeffs_dc"], p1["sh_coeffs_rest"])
+    img_cuda = cuda_render(
+        w2c, intrinsic, W, H, p1["means"], s1, q1, o1, p1["sh_coeffs_dc"], p1["sh_coeffs_rest"]
+    )
 
     p2 = clone_params()
     s2, q2, o2 = prepare(p2)
-    img_torch = torch_render(w2c, intrinsic, W, H, p2["means"], s2, q2, o2,
-                             p2["sh_coeffs_dc"], p2["sh_coeffs_rest"])
+    img_torch = torch_render(
+        w2c, intrinsic, W, H, p2["means"], s2, q2, o2, p2["sh_coeffs_dc"], p2["sh_coeffs_rest"]
+    )
 
     diff = (img_cuda - img_torch).abs()
     print(f"\nForward image comparison:")
@@ -84,8 +87,10 @@ def main():
         gt = p2[n].grad.flatten()
         cos = torch.dot(gc, gt).item() / max(gc.norm().item() * gt.norm().item(), 1e-12)
         rel = (gc - gt).norm().item() / max(gt.norm().item(), 1e-12)
-        print(f"  {n:16s} cos={cos:.6f} rel={rel:.6e} "
-              f"norm_cuda={gc.norm():.6e} norm_torch={gt.norm():.6e}")
+        print(
+            f"  {n:16s} cos={cos:.6f} rel={rel:.6e} "
+            f"norm_cuda={gc.norm():.6e} norm_torch={gt.norm():.6e}"
+        )
 
     # check which Gaussians have the biggest gradient difference
     diff_means = (p1["means"].grad - p2["means"].grad).norm(dim=1)
@@ -94,8 +99,7 @@ def main():
     for i, (val, idx) in enumerate(zip(topk.values, topk.indices)):
         gc = p1["means"].grad[idx]
         gt = p2["means"].grad[idx]
-        print(f"  [{i}] idx={idx.item()} diff={val:.6f} "
-              f"cuda={gc.tolist()} torch={gt.tolist()}")
+        print(f"  [{i}] idx={idx.item()} diff={val:.6f} cuda={gc.tolist()} torch={gt.tolist()}")
 
 
 if __name__ == "__main__":

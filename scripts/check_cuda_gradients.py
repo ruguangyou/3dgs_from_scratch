@@ -57,8 +57,10 @@ def check_project_points(seed: int, device: str, thresholds: Thresholds) -> bool
     points = points.detach().requires_grad_(True)
     scales = (torch.rand(count, 3, device=device) * 0.2 + 0.8).detach().requires_grad_(True)
     quaternions_raw = torch.randn(count, 4, device=device)
-    quaternions = (quaternions_raw / torch.norm(quaternions_raw, dim=1, keepdim=True)).detach().requires_grad_(
-        True
+    quaternions = (
+        (quaternions_raw / torch.norm(quaternions_raw, dim=1, keepdim=True))
+        .detach()
+        .requires_grad_(True)
     )
     opacities = torch.ones(count, device=device) * 0.8
 
@@ -80,17 +82,19 @@ def check_project_points(seed: int, device: str, thresholds: Thresholds) -> bool
 
     upstream_points = torch.randn_like(points_img)
     upstream_cov_inv = torch.randn_like(cov_inv_img) * 0.1
-    grad_points_cuda, grad_scales_cuda, grad_quaternions_cuda = cuda_rasterizer.project_points_backward(
-        upstream_points,
-        upstream_cov_inv,
-        points,
-        scales,
-        quaternions,
-        opacities,
-        world_to_camera,
-        intrinsic,
-        cov_img,
-        mask,
+    grad_points_cuda, grad_scales_cuda, grad_quaternions_cuda = (
+        cuda_rasterizer.project_points_backward(
+            upstream_points,
+            upstream_cov_inv,
+            points,
+            scales,
+            quaternions,
+            opacities,
+            world_to_camera,
+            intrinsic,
+            cov_img,
+            mask,
+        )
     )
 
     points_camera = (world_to_camera[:3, :3] @ points.t()).t() + world_to_camera[:3, 3]
@@ -155,7 +159,9 @@ def check_project_points(seed: int, device: str, thresholds: Thresholds) -> bool
     values = [
         metric("points", grad_points_cuda * valid_mask_3, grad_points_ref * valid_mask_3),
         metric("scales", grad_scales_cuda * valid_mask_3, grad_scales_ref * valid_mask_3),
-        metric("quaternions", grad_quaternions_cuda * valid_mask_3, grad_quaternions_ref * valid_mask_3),
+        metric(
+            "quaternions", grad_quaternions_cuda * valid_mask_3, grad_quaternions_ref * valid_mask_3
+        ),
     ]
     return check_result("project_points", values, thresholds)
 
@@ -199,20 +205,22 @@ def check_rasterize(seed: int, device: str, thresholds: Thresholds) -> bool:
     )
     upstream = torch.randn_like(rendered)
 
-    grad_points_cuda, grad_cov_cuda, grad_opacities_cuda, grad_colors_cuda = cuda_rasterizer.rasterize_backward(
-        upstream,
-        indexing_offset,
-        gaussian_ids_sorted,
-        points_img,
-        cov_inv_img,
-        opacities,
-        colors,
-        width,
-        height,
-        tile_size,
-        alpha_threshold,
-        transmittance_threshold,
-        chi_squared_threshold,
+    grad_points_cuda, grad_cov_cuda, grad_opacities_cuda, grad_colors_cuda = (
+        cuda_rasterizer.rasterize_backward(
+            upstream,
+            indexing_offset,
+            gaussian_ids_sorted,
+            points_img,
+            cov_inv_img,
+            opacities,
+            colors,
+            width,
+            height,
+            tile_size,
+            alpha_threshold,
+            transmittance_threshold,
+            chi_squared_threshold,
+        )
     )
 
     unique_tiles = indexing_offset.shape[0]
@@ -223,7 +231,9 @@ def check_rasterize(seed: int, device: str, thresholds: Thresholds) -> bool:
         row = tile_id // num_tiles_per_row
         col = tile_id % num_tiles_per_row
         range_start = indexing_offset[tile_id].item()
-        range_end = indexing_offset[tile_id + 1].item() if tile_id + 1 < unique_tiles else total_tiles
+        range_end = (
+            indexing_offset[tile_id + 1].item() if tile_id + 1 < unique_tiles else total_tiles
+        )
 
         for idx_in_tile in range(tile_size * tile_size):
             u = col * tile_size + (idx_in_tile % tile_size)
@@ -288,7 +298,9 @@ def check_sh(seed: int, device: str, thresholds: Thresholds) -> bool:
     sh_dc_ref = sh_dc_cuda.detach().clone().requires_grad_(True)
     sh_rest_ref = sh_rest_cuda.detach().clone().requires_grad_(True)
 
-    colors_cuda = SphericalHarmonicsFunction.apply(camera_pos, means_cuda, sh_dc_cuda, sh_rest_cuda, mask)
+    colors_cuda = SphericalHarmonicsFunction.apply(
+        camera_pos, means_cuda, sh_dc_cuda, sh_rest_cuda, mask
+    )
     loss_cuda = (colors_cuda * 0.3).sum()
     loss_cuda.backward()
 
@@ -374,9 +386,15 @@ def check_end_to_end(seed: int, device: str, thresholds: Thresholds) -> bool:
             parameters_cuda["quaternions_raw"].grad,
             parameters_ref["quaternions_raw"].grad,
         ),
-        metric("opacities_raw", parameters_cuda["opacities_raw"].grad, parameters_ref["opacities_raw"].grad),
+        metric(
+            "opacities_raw",
+            parameters_cuda["opacities_raw"].grad,
+            parameters_ref["opacities_raw"].grad,
+        ),
         metric("sh_dc_raw", parameters_cuda["sh_dc_raw"].grad, parameters_ref["sh_dc_raw"].grad),
-        metric("sh_rest_raw", parameters_cuda["sh_rest_raw"].grad, parameters_ref["sh_rest_raw"].grad),
+        metric(
+            "sh_rest_raw", parameters_cuda["sh_rest_raw"].grad, parameters_ref["sh_rest_raw"].grad
+        ),
     ]
 
     threshold_overrides = {
@@ -409,11 +427,19 @@ def check_end_to_end_real_train_loss(seed: int, device: str, thresholds: Thresho
     intrinsic = sample["intrinsic"].to(device)
     target_image = sample["image"].to(device)
 
-    parameter_names = ["means", "scales", "quaternions", "opacities", "sh_coeffs_dc", "sh_coeffs_rest"]
+    parameter_names = [
+        "means",
+        "scales",
+        "quaternions",
+        "opacities",
+        "sh_coeffs_dc",
+        "sh_coeffs_rest",
+    ]
 
     def clone_parameters() -> dict[str, torch.Tensor]:
         return {
-            name: base_params[name].detach().clone().requires_grad_(True) for name in parameter_names
+            name: base_params[name].detach().clone().requires_grad_(True)
+            for name in parameter_names
         }
 
     def forward_loss(render_function, params: dict[str, torch.Tensor]) -> torch.Tensor:
@@ -457,7 +483,9 @@ def check_end_to_end_real_train_loss(seed: int, device: str, thresholds: Thresho
         metric("quaternions", params_cuda["quaternions"].grad, params_ref["quaternions"].grad),
         metric("opacities", params_cuda["opacities"].grad, params_ref["opacities"].grad),
         metric("sh_coeffs_dc", params_cuda["sh_coeffs_dc"].grad, params_ref["sh_coeffs_dc"].grad),
-        metric("sh_coeffs_rest", params_cuda["sh_coeffs_rest"].grad, params_ref["sh_coeffs_rest"].grad),
+        metric(
+            "sh_coeffs_rest", params_cuda["sh_coeffs_rest"].grad, params_ref["sh_coeffs_rest"].grad
+        ),
     ]
 
     threshold_overrides = {
@@ -497,7 +525,9 @@ def main() -> None:
         all_ok = check_sh(seed + 200, args.device, thresholds) and all_ok
         all_ok = check_end_to_end(seed + 300, args.device, thresholds) and all_ok
         if not args.skip_real_train_loss:
-            all_ok = check_end_to_end_real_train_loss(seed + 400, args.device, thresholds) and all_ok
+            all_ok = (
+                check_end_to_end_real_train_loss(seed + 400, args.device, thresholds) and all_ok
+            )
 
     if not all_ok:
         raise SystemExit(1)

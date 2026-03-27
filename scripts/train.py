@@ -140,7 +140,9 @@ def train(
             # recalculate the intermediate variables that depend on the learnable parameters
             scales = torch.exp(learnable_params["scales"])
             quaternions = learnable_params["quaternions"]
-            quaternions = quaternions / torch.norm(quaternions, dim=1, keepdim=True).clamp_min(1e-12)
+            quaternions = quaternions / torch.norm(quaternions, dim=1, keepdim=True).clamp_min(
+                1e-12
+            )
             opacities = torch.sigmoid(learnable_params["opacities"])
 
             ensure_finite("scales", scales)
@@ -244,10 +246,10 @@ def train(
                 writer.add_scalar("train/ssim_lambda", effective_ssim_lambda, step)
                 writer.add_scalar("train/means_lr", optimizers["means"].param_groups[0]["lr"], step)
                 # monitor scale magnitude to detect explosion early
-                writer.add_scalar("train/scale_raw_abs_max",
-                                  learnable_params["scales"].abs().max().item(), step)
-                writer.add_scalar("train/opacity_mean",
-                                  opacities.mean().item(), step)
+                writer.add_scalar(
+                    "train/scale_raw_abs_max", learnable_params["scales"].abs().max().item(), step
+                )
+                writer.add_scalar("train/opacity_mean", opacities.mean().item(), step)
 
                 if step % tensorboard_image_interval == 0:
                     writer.add_image("train/rendered", to_tb_image(rendered_image), step)

@@ -21,12 +21,12 @@ class ProjectPointsFunction(torch.autograd.Function):
         height,
     ):
         points_img, depths, cov_img, cov_inv_img, radii, mask = cuda_rasterizer.project_points(
-            means,
-            scales,
-            quaternions,
-            opacities,
-            world_to_camera,
-            intrinsic,
+            means.contiguous(),
+            scales.contiguous(),
+            quaternions.contiguous(),
+            opacities.contiguous(),
+            world_to_camera.contiguous(),
+            intrinsic.contiguous(),
             near_plane,
             far_plane,
             min_opacity,
@@ -46,16 +46,16 @@ class ProjectPointsFunction(torch.autograd.Function):
             ctx.saved_tensors
         )
         grad_means, grad_scales, grad_quaternions = cuda_rasterizer.project_points_backward(
-            grad_points_img,
-            grad_cov_inv_img,
-            means,
-            scales,
-            quaternions,
-            opacities,
-            world_to_camera,
-            intrinsic,
-            cov_img,
-            mask,
+            grad_points_img.contiguous(),
+            grad_cov_inv_img.contiguous(),
+            means.contiguous(),
+            scales.contiguous(),
+            quaternions.contiguous(),
+            opacities.contiguous(),
+            world_to_camera.contiguous(),
+            intrinsic.contiguous(),
+            cov_img.contiguous(),
+            mask.contiguous(),
         )
         return (
             grad_means,
@@ -78,7 +78,11 @@ class SphericalHarmonicsFunction(torch.autograd.Function):
     @staticmethod
     def forward(ctx, camera_pos, means, sh_coeffs_dc, sh_coeffs_rest, mask):
         colors = cuda_rasterizer.evaluate_spherical_harmonics(
-            camera_pos, means, sh_coeffs_dc, sh_coeffs_rest, mask
+            camera_pos.contiguous(),
+            means.contiguous(),
+            sh_coeffs_dc.contiguous(),
+            sh_coeffs_rest.contiguous(),
+            mask.contiguous(),
         )
         ctx.save_for_backward(camera_pos, means, sh_coeffs_dc, sh_coeffs_rest, colors, mask)
         return colors
@@ -88,13 +92,13 @@ class SphericalHarmonicsFunction(torch.autograd.Function):
         camera_pos, means, sh_coeffs_dc, sh_coeffs_rest, colors, mask = ctx.saved_tensors
         grad_means, grad_sh_coeffs_dc, grad_sh_coeffs_rest = (
             cuda_rasterizer.evaluate_spherical_harmonics_backward(
-                grad_colors,
-                camera_pos,
-                means,
-                sh_coeffs_dc,
-                sh_coeffs_rest,
-                colors,
-                mask,
+                grad_colors.contiguous(),
+                camera_pos.contiguous(),
+                means.contiguous(),
+                sh_coeffs_dc.contiguous(),
+                sh_coeffs_rest.contiguous(),
+                colors.contiguous(),
+                mask.contiguous(),
             )
         )
         return None, grad_means, grad_sh_coeffs_dc, grad_sh_coeffs_rest, None
@@ -118,12 +122,12 @@ class RasterizeFunction(torch.autograd.Function):
         chi_squared_threshold,
     ):
         rendered_image = cuda_rasterizer.rasterize(
-            indexing_offset,
-            gaussian_ids_sorted,
-            points_img,
-            cov_inv_img,
-            opacities,
-            colors,
+            indexing_offset.contiguous(),
+            gaussian_ids_sorted.contiguous(),
+            points_img.contiguous(),
+            cov_inv_img.contiguous(),
+            opacities.contiguous(),
+            colors.contiguous(),
             width,
             height,
             tile_size,
@@ -151,7 +155,6 @@ class RasterizeFunction(torch.autograd.Function):
     def backward(ctx, grad_rendered_image):
         # ensure contiguous layout — upstream gradients (e.g. from permute in SSIM)
         # may have non-standard strides that CUDA kernels cannot handle
-        grad_rendered_image = grad_rendered_image.contiguous()
         (
             indexing_offset,
             gaussian_ids_sorted,
@@ -173,13 +176,13 @@ class RasterizeFunction(torch.autograd.Function):
             grad_opacities,
             grad_colors,
         ) = cuda_rasterizer.rasterize_backward(
-            grad_rendered_image,
-            indexing_offset,
-            gaussian_ids_sorted,
-            points_img,
-            cov_inv_img,
-            opacities,
-            colors,
+            grad_rendered_image.contiguous(),
+            indexing_offset.contiguous(),
+            gaussian_ids_sorted.contiguous(),
+            points_img.contiguous(),
+            cov_inv_img.contiguous(),
+            opacities.contiguous(),
+            colors.contiguous(),
             width,
             height,
             tile_size,
@@ -245,7 +248,13 @@ def render(
 
     tile_size = 16
     indexing_offset, gaussian_ids_sorted = cuda_rasterizer.compute_tile_intersection(
-        points_img, radii, depths, mask, width, height, tile_size
+        points_img.contiguous(),
+        radii.contiguous(),
+        depths.contiguous(),
+        mask.contiguous(),
+        width,
+        height,
+        tile_size,
     )
 
     rendered_image = RasterizeFunction.apply(

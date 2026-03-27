@@ -1,4 +1,5 @@
 """Check if clamp difference causes SSIM gradient divergence."""
+
 import pickle
 import torch
 from fused_ssim import fused_ssim
@@ -35,7 +36,8 @@ def main():
     def prepare(params):
         scales = torch.exp(params["scales"])
         quats = params["quaternions"] / torch.norm(
-            params["quaternions"], dim=1, keepdim=True).clamp_min(1e-12)
+            params["quaternions"], dim=1, keepdim=True
+        ).clamp_min(1e-12)
         opac = torch.sigmoid(params["opacities"])
         return scales, quats, opac
 
@@ -43,10 +45,12 @@ def main():
     p0 = clone_params()
     s0, q0, o0 = prepare(p0)
     with torch.no_grad():
-        img_cuda = cuda_render(w2c, intrinsic, W, H, p0["means"], s0, q0, o0,
-                               p0["sh_coeffs_dc"], p0["sh_coeffs_rest"])
-        img_torch = torch_render(w2c, intrinsic, W, H, p0["means"], s0, q0, o0,
-                                 p0["sh_coeffs_dc"], p0["sh_coeffs_rest"])
+        img_cuda = cuda_render(
+            w2c, intrinsic, W, H, p0["means"], s0, q0, o0, p0["sh_coeffs_dc"], p0["sh_coeffs_rest"]
+        )
+        img_torch = torch_render(
+            w2c, intrinsic, W, H, p0["means"], s0, q0, o0, p0["sh_coeffs_dc"], p0["sh_coeffs_rest"]
+        )
 
     # check range before scaling (divide by 255)
     cuda_pre = img_cuda / 255.0
@@ -70,8 +74,9 @@ def main():
     # CUDA with clamp (like torch)
     p1 = clone_params()
     s1, q1, o1 = prepare(p1)
-    img1_raw = cuda_render(w2c, intrinsic, W, H, p1["means"], s1, q1, o1,
-                           p1["sh_coeffs_dc"], p1["sh_coeffs_rest"])
+    img1_raw = cuda_render(
+        w2c, intrinsic, W, H, p1["means"], s1, q1, o1, p1["sh_coeffs_dc"], p1["sh_coeffs_rest"]
+    )
     img1_clamped = (img1_raw / 255.0).clamp(0, 1) * 255.0
     loss1 = compute_ssim_loss(img1_clamped, target)
     loss1.backward()
@@ -79,8 +84,9 @@ def main():
     # Torch (already has clamp)
     p2 = clone_params()
     s2, q2, o2 = prepare(p2)
-    img2 = torch_render(w2c, intrinsic, W, H, p2["means"], s2, q2, o2,
-                        p2["sh_coeffs_dc"], p2["sh_coeffs_rest"])
+    img2 = torch_render(
+        w2c, intrinsic, W, H, p2["means"], s2, q2, o2, p2["sh_coeffs_dc"], p2["sh_coeffs_rest"]
+    )
     loss2 = compute_ssim_loss(img2, target)
     loss2.backward()
 
