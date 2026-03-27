@@ -905,6 +905,9 @@ __global__ void rasterize_kernel(
     float transmittance = 1.0f;
     int32_t range_start = indexing_offset[tile_id];
     int32_t range_end = (tile_id + 1 < unique_tiles) ? indexing_offset[tile_id+1] : total_tiles;
+    float r = 0.0f;
+    float g = 0.0f;
+    float b = 0.0f;
     for (int32_t i = range_start; i < range_end; ++i) {
         int32_t gaussian_id = gaussian_ids_sorted[i];
         float du = u - points_image[gaussian_id*2];
@@ -924,15 +927,20 @@ __global__ void rasterize_kernel(
         }
 
         float weight = alpha * transmittance;
-        atomicAdd(&output_image[(v * width + u) * 3], weight * colors[gaussian_id*3]);
-        atomicAdd(&output_image[(v * width + u) * 3 + 1], weight * colors[gaussian_id*3 + 1]);
-        atomicAdd(&output_image[(v * width + u) * 3 + 2], weight * colors[gaussian_id*3 + 2]);
+        r += weight * colors[gaussian_id*3];
+        g += weight * colors[gaussian_id*3 + 1];
+        b += weight * colors[gaussian_id*3 + 2];
 
         transmittance *= (1.0f - alpha);
         if (transmittance < transmittance_threshold) {
             break;
         }
     }
+
+    // clamp output color to [0, 1]
+    output_image[(v * width + u) * 3] = fminf(fmaxf(r, 0.0f), 1.0f);
+    output_image[(v * width + u) * 3 + 1] = fminf(fmaxf(g, 0.0f), 1.0f);
+    output_image[(v * width + u) * 3 + 2] = fminf(fmaxf(b, 0.0f), 1.0f);
 }
 
 __global__ void rasterize_backward_kernel(
