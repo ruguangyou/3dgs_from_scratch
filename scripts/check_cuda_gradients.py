@@ -75,7 +75,9 @@ def build_reference_tile_layout(
         tile_u_max = u_max // tile_size
         tile_v_min = v_min // tile_size
         tile_v_max = v_max // tile_size
-        depth_bits = depths[gaussian_id : gaussian_id + 1].detach().view(torch.int32).item() & 0xFFFFFFFF
+        depth_bits = (
+            depths[gaussian_id : gaussian_id + 1].detach().view(torch.int32).item() & 0xFFFFFFFF
+        )
 
         for tile_v in range(tile_v_min, tile_v_max + 1):
             for tile_u in range(tile_u_min, tile_u_max + 1):
@@ -423,33 +425,45 @@ def check_rasterize_multitile(seed: int, device: str, thresholds: Thresholds) ->
     mask = torch.ones(points_base.shape[0], device=device, dtype=torch.bool)
 
     points_img = points_base.detach().clone().requires_grad_(True)
-    cov_inv_img = torch.tensor(
-        [
-            [0.085, 0.012, 0.072],
-            [0.078, -0.009, 0.088],
-            [0.094, 0.004, 0.109],
-            [0.103, -0.006, 0.091],
-            [0.162, 0.000, 0.149],
-        ],
-        device=device,
-        dtype=torch.float32,
-    ).detach().requires_grad_(True)
-    opacities = torch.tensor(
-        [0.82, 0.67, 0.73, 0.58, 0.91],
-        device=device,
-        dtype=torch.float32,
-    ).detach().requires_grad_(True)
-    colors = torch.tensor(
-        [
-            [0.90, 0.25, 0.10],
-            [0.15, 0.80, 0.35],
-            [0.30, 0.40, 0.95],
-            [0.85, 0.55, 0.20],
-            [0.60, 0.75, 0.90],
-        ],
-        device=device,
-        dtype=torch.float32,
-    ).detach().requires_grad_(True)
+    cov_inv_img = (
+        torch.tensor(
+            [
+                [0.085, 0.012, 0.072],
+                [0.078, -0.009, 0.088],
+                [0.094, 0.004, 0.109],
+                [0.103, -0.006, 0.091],
+                [0.162, 0.000, 0.149],
+            ],
+            device=device,
+            dtype=torch.float32,
+        )
+        .detach()
+        .requires_grad_(True)
+    )
+    opacities = (
+        torch.tensor(
+            [0.82, 0.67, 0.73, 0.58, 0.91],
+            device=device,
+            dtype=torch.float32,
+        )
+        .detach()
+        .requires_grad_(True)
+    )
+    colors = (
+        torch.tensor(
+            [
+                [0.90, 0.25, 0.10],
+                [0.15, 0.80, 0.35],
+                [0.30, 0.40, 0.95],
+                [0.85, 0.55, 0.20],
+                [0.60, 0.75, 0.90],
+            ],
+            device=device,
+            dtype=torch.float32,
+        )
+        .detach()
+        .requires_grad_(True)
+    )
 
     alpha_threshold = 0.0
     transmittance_threshold = 0.0
@@ -594,15 +608,23 @@ def check_rasterize_multitile_truncated(seed: int, device: str, thresholds: Thre
     cov_inv_img[:, 1] = torch.linspace(-0.007, 0.007, points_base.shape[0], device=device)
     cov_inv_img[:, 2] = torch.linspace(0.078, 0.115, points_base.shape[0], device=device)
     cov_inv_img = cov_inv_img.detach().requires_grad_(True)
-    opacities = torch.linspace(0.72, 0.94, points_base.shape[0], device=device).detach().requires_grad_(True)
-    colors = torch.stack(
-        [
-            torch.linspace(0.15, 0.95, points_base.shape[0], device=device),
-            torch.linspace(0.90, 0.20, points_base.shape[0], device=device),
-            torch.linspace(0.25, 0.85, points_base.shape[0], device=device),
-        ],
-        dim=-1,
-    ).detach().requires_grad_(True)
+    opacities = (
+        torch.linspace(0.72, 0.94, points_base.shape[0], device=device)
+        .detach()
+        .requires_grad_(True)
+    )
+    colors = (
+        torch.stack(
+            [
+                torch.linspace(0.15, 0.95, points_base.shape[0], device=device),
+                torch.linspace(0.90, 0.20, points_base.shape[0], device=device),
+                torch.linspace(0.25, 0.85, points_base.shape[0], device=device),
+            ],
+            dim=-1,
+        )
+        .detach()
+        .requires_grad_(True)
+    )
 
     alpha_threshold = 1e-4
     transmittance_threshold = 1e-4

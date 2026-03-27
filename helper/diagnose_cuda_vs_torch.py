@@ -2,6 +2,7 @@
 Diagnose differences between CUDA and torch rasterizers.
 Compare forward outputs and backward gradients on identical inputs.
 """
+
 from __future__ import annotations
 
 import pickle
@@ -47,10 +48,30 @@ def compare_forward():
     opac = torch.sigmoid(params["opacities"])
 
     with torch.no_grad():
-        img_cuda = cuda_render(w2c, K, W, H, params["means"], scales, quats, opac,
-                               params["sh_coeffs_dc"], params["sh_coeffs_rest"])
-        img_torch = torch_render(w2c, K, W, H, params["means"], scales, quats, opac,
-                                 params["sh_coeffs_dc"], params["sh_coeffs_rest"])
+        img_cuda = cuda_render(
+            w2c,
+            K,
+            W,
+            H,
+            params["means"],
+            scales,
+            quats,
+            opac,
+            params["sh_coeffs_dc"],
+            params["sh_coeffs_rest"],
+        )
+        img_torch = torch_render(
+            w2c,
+            K,
+            W,
+            H,
+            params["means"],
+            scales,
+            quats,
+            opac,
+            params["sh_coeffs_dc"],
+            params["sh_coeffs_rest"],
+        )
 
     diff = (img_cuda - img_torch).abs()
     print(f"Forward comparison (H={H}, W={W}, N={POINTS}):")
@@ -90,24 +111,24 @@ def compare_gradients():
 
     results = {}
     for tag, render_fn in [("cuda", cuda_render), ("torch", torch_render)]:
-        p = {
-            name: t.detach().clone().requires_grad_(True)
-            for name, t in base_params.items()
-        }
+        p = {name: t.detach().clone().requires_grad_(True) for name, t in base_params.items()}
         scales = torch.exp(p["scales"])
-        quats = p["quaternions"] / torch.norm(
-            p["quaternions"], dim=1, keepdim=True
-        ).clamp_min(1e-12)
+        quats = p["quaternions"] / torch.norm(p["quaternions"], dim=1, keepdim=True).clamp_min(
+            1e-12
+        )
         opac = torch.sigmoid(p["opacities"])
 
-        img = render_fn(w2c, K, W, H, p["means"], scales, quats, opac,
-                        p["sh_coeffs_dc"], p["sh_coeffs_rest"])
+        img = render_fn(
+            w2c, K, W, H, p["means"], scales, quats, opac, p["sh_coeffs_dc"], p["sh_coeffs_rest"]
+        )
         loss = torch.nn.functional.l1_loss(img / 255.0, target / 255.0)
         loss.backward()
         results[tag] = {
             "loss": loss.item(),
             "image": img.detach(),
-            "grads": {name: p[name].grad.detach().clone() for name in p if p[name].grad is not None},
+            "grads": {
+                name: p[name].grad.detach().clone() for name in p if p[name].grad is not None
+            },
         }
 
     print(f"\nGradient comparison:")
@@ -123,8 +144,10 @@ def compare_gradients():
         rel = (gc - gt).norm().item() / max(gt.norm().item(), 1e-12)
         mean_cuda = gc.mean().item()
         mean_torch = gt.mean().item()
-        print(f"  {name:20s} cos={cos:.6f} rel={rel:.6e} "
-              f"mean_cuda={mean_cuda:+.6e} mean_torch={mean_torch:+.6e}")
+        print(
+            f"  {name:20s} cos={cos:.6f} rel={rel:.6e} "
+            f"mean_cuda={mean_cuda:+.6e} mean_torch={mean_torch:+.6e}"
+        )
 
 
 def compare_intermediate():
@@ -146,33 +169,45 @@ def compare_intermediate():
     H, W = target.shape[0], target.shape[1]
 
     scales = torch.exp(params["scales"]).detach()
-    quats = (params["quaternions"] / torch.norm(
-        params["quaternions"], dim=1, keepdim=True
-    ).clamp_min(1e-12)).detach()
+    quats = (
+        params["quaternions"]
+        / torch.norm(params["quaternions"], dim=1, keepdim=True).clamp_min(1e-12)
+    ).detach()
     opac = torch.sigmoid(params["opacities"]).detach()
     means = params["means"].detach()
     sh_dc = params["sh_coeffs_dc"].detach()
     sh_rest = params["sh_coeffs_rest"].detach()
 
     # --- CUDA intermediate ---
-    pts_img_c, depths_c, cov_c, cov_inv_c, radii_c, mask_c = (
-        cuda_rasterizer.project_points(
-            means.contiguous(), scales.contiguous(), quats.contiguous(), opac.contiguous(),
-            w2c.contiguous(), K.contiguous(), 0.01, 100.0, 1/255, 0.5, 128.0, W, H,
-        )
+    pts_img_c, depths_c, cov_c, cov_inv_c, radii_c, mask_c = cuda_rasterizer.project_points(
+        means.contiguous(),
+        scales.contiguous(),
+        quats.contiguous(),
+        opac.contiguous(),
+        w2c.contiguous(),
+        K.contiguous(),
+        0.01,
+        100.0,
+        1 / 255,
+        0.5,
+        128.0,
+        W,
+        H,
     )
     camera_pos = -w2c[:3, :3].t() @ w2c[:3, 3]
     colors_c = cuda_rasterizer.evaluate_spherical_harmonics(
-        camera_pos.contiguous(), means.contiguous(), sh_dc.contiguous(),
-        sh_rest.contiguous(), mask_c.contiguous(),
+        camera_pos.contiguous(),
+        means.contiguous(),
+        sh_dc.contiguous(),
+        sh_rest.contiguous(),
+        mask_c.contiguous(),
     )
 
     # --- Torch intermediate ---
     from src.gaussian import evaluate_spherical_harmonics, quaternion_to_rotation_matrix
+
     N = means.shape[0]
-    points_cam = (
-        w2c @ torch.cat([means, torch.ones(N, 1, device=DEVICE)], dim=1).t()
-    )[:3, :]
+    points_cam = (w2c @ torch.cat([means, torch.ones(N, 1, device=DEVICE)], dim=1).t())[:3, :]
     depth_t = points_cam[2, :]
     x, y, z = points_cam.unbind(0)
     fx, fy = K[0, 0], K[1, 1]

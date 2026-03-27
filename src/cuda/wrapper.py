@@ -203,7 +203,6 @@ class RasterizeFunction(torch.autograd.Function):
             None,
             None,
             None,
-            None,
         )
 
 

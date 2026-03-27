@@ -54,9 +54,10 @@ def evaluate(ckpt_path, use_cuda_rasterizer=True):
             sh_coeffs_rest,
         )
 
+        # Normalize to [0, 1] so fused_ssim uses the correct c1/c2 constants (L=1).
         ssim_score = fused_ssim(
-            rendered_image.permute(2, 0, 1).unsqueeze(0),  # (H, W, C) -> (1, C, H, W)
-            target_image.permute(2, 0, 1).unsqueeze(0),  # (H, W, C) -> (1, C, H, W)
+            rendered_image.permute(2, 0, 1).unsqueeze(0) / 255.0,
+            target_image.permute(2, 0, 1).unsqueeze(0) / 255.0,
             padding="valid",
         ).item()
         logging.info(f"Evaluation image {idx}: SSIM = {ssim_score:.4f}")

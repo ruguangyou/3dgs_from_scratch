@@ -174,12 +174,19 @@ def train(
             )
             ensure_finite("rendered_image", rendered_image)
 
+            # Normalize to [0, 1] for loss computation.
+            # render() outputs [0, 255] and target_image is also uint8 [0, 255].
+            # fused_ssim expects [0, 1] (uses c1=(0.01)^2, c2=(0.03)^2 for L=1),
+            # and scale_reg is calibrated for [0, 1] pixel loss.
+            rendered_norm = rendered_image / 255.0
+            target_norm = target_image / 255.0
+
             # L1 loss on pixel colors
-            l1_loss = torch.nn.functional.l1_loss(rendered_image, target_image)
+            l1_loss = torch.nn.functional.l1_loss(rendered_norm, target_norm)
             # Dissimilarity SSIM on structural similarity
             ssim_loss = 1.0 - fused_ssim(
-                rendered_image.permute(2, 0, 1).unsqueeze(0),  # (H, W, C) -> (1, C, H, W)
-                target_image.permute(2, 0, 1).unsqueeze(0),  # (H, W, C) -> (1, C, H, W)
+                rendered_norm.permute(2, 0, 1).unsqueeze(0),  # (H, W, C) -> (1, C, H, W)
+                target_norm.permute(2, 0, 1).unsqueeze(0),  # (H, W, C) -> (1, C, H, W)
                 padding="valid",  # no padding to avoid border artifacts
             )
 
@@ -247,7 +254,13 @@ def train(
                 writer.add_scalar("train/means_lr", optimizers["means"].param_groups[0]["lr"], step)
                 # monitor scale magnitude to detect explosion early
                 writer.add_scalar(
-                    "train/scale_raw_abs_max", learnable_params["scales"].abs().max().item(), step
+                    "train/scale_raw_max", learnable_params["scales"].max().item(), step
+                )
+                writer.add_scalar(
+                    "train/scale_raw_min", learnable_params["scales"].min().item(), step
+                )
+                writer.add_scalar(
+                    "train/scale_raw_mean", learnable_params["scales"].mean().item(), step
                 )
                 writer.add_scalar("train/opacity_mean", opacities.mean().item(), step)
 
@@ -292,11 +305,11 @@ def train(
 if __name__ == "__main__":
     train(
         max_steps=5000,
-        downsample_points=True,
+        downsample_points=False,
         initial_max_points=50000,
         use_cuda_rasterizer=True,
         ssim_warmup_steps=3000,
         grad_clip_norm=1.0,
         scale_reg=0.01,
-        opacity_reset_interval=3000,
+        opacity_reset_interval=0,
     )

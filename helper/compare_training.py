@@ -2,6 +2,7 @@
 Side-by-side training with CUDA and torch rasterizers.
 Track loss, image center-of-mass, and parameter divergence per step.
 """
+
 from __future__ import annotations
 
 import math
@@ -78,9 +79,16 @@ def run_training(
         target = cam["image"].to(DEVICE)
 
         img = render_fn(
-            w2c, K, target.shape[1], target.shape[0],
-            params["means"], scales, quats, opac,
-            params["sh_coeffs_dc"], params["sh_coeffs_rest"],
+            w2c,
+            K,
+            target.shape[1],
+            target.shape[0],
+            params["means"],
+            scales,
+            quats,
+            opac,
+            params["sh_coeffs_dc"],
+            params["sh_coeffs_rest"],
         )
         rn = img / 255.0
         tn = target / 255.0
@@ -111,7 +119,8 @@ def run_training(
                 "loss": float(loss.item()),
                 "l1": float(l1_loss.item()),
                 "render_mean": float(rn.mean().item()),
-                "cx": cx, "cy": cy,
+                "cx": cx,
+                "cy": cy,
                 "means_norm": float(params["means"].detach().norm().item()),
                 "scale_mean": float(params["scales"].detach().mean().item()),
                 "scale_max": float(params["scales"].detach().max().item()),
@@ -148,11 +157,13 @@ def main() -> None:
     print("\n" + "=" * 80)
     print("COMPARISON SUMMARY")
     print("=" * 80)
-    print(f"{'step':>4s}  {'cuda_loss':>10s} {'torch_loss':>10s} {'delta_loss':>10s}  "
-          f"{'cuda_cx':>8s} {'cuda_cy':>8s} {'torch_cx':>8s} {'torch_cy':>8s}")
+    print(
+        f"{'step':>4s}  {'cuda_loss':>10s} {'torch_loss':>10s} {'delta_loss':>10s}  "
+        f"{'cuda_cx':>8s} {'cuda_cy':>8s} {'torch_cx':>8s} {'torch_cy':>8s}"
+    )
     for c, t in zip(cuda_recs, torch_recs, strict=True):
         print(
-            f"{c['step']:4d}  {c['loss']:10.6f} {t['loss']:10.6f} {c['loss']-t['loss']:+10.6f}  "
+            f"{c['step']:4d}  {c['loss']:10.6f} {t['loss']:10.6f} {c['loss'] - t['loss']:+10.6f}  "
             f"{c['cx']:+8.4f} {c['cy']:+8.4f} {t['cx']:+8.4f} {t['cy']:+8.4f}"
         )
 
