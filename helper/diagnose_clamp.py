@@ -74,11 +74,10 @@ def main():
     # CUDA with clamp (like torch)
     p1 = clone_params()
     s1, q1, o1 = prepare(p1)
-    img1_raw = cuda_render(
+    img1 = cuda_render(
         w2c, intrinsic, W, H, p1["means"], s1, q1, o1, p1["sh_coeffs_dc"], p1["sh_coeffs_rest"]
     )
-    img1_clamped = (img1_raw / 255.0).clamp(0, 1) * 255.0
-    loss1 = compute_ssim_loss(img1_clamped, target)
+    loss1 = compute_ssim_loss(img1, target)
     loss1.backward()
 
     # Torch (already has clamp)
@@ -90,7 +89,7 @@ def main():
     loss2 = compute_ssim_loss(img2, target)
     loss2.backward()
 
-    print(f"\nSSIM loss: cuda_clamped={loss1.item():.6f} torch={loss2.item():.6f}")
+    print(f"\nSSIM loss: cuda={loss1.item():.6f} torch={loss2.item():.6f}")
     print(f"\nGradient comparison (CUDA with clamp vs Torch):")
     for n in names:
         gc = p1[n].grad.flatten()

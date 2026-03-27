@@ -102,14 +102,24 @@ def initialize(
     # rgbs shape: (N, 3) in [0, 1] range
     N = points.shape[0]
 
+    # With isotropic scales, S = diag(s, s, s), Cov = R * S * S * R^T = s^2 * R * R^T = s^2 * I.
+    # This can degenerate gradients for rotation since it has no effect on the final covariance.
+    # By adding a small probe to the initial scales, we can break this symmetry and allow the
+    # model to learn meaningful rotations.
+
+    # make initial scales anisotropic by adding probe
+    scale_probe = init_scale * torch.tensor([1.0, 1.01, 0.99], dtype=torch.float32)
+
     # initalize gaussians size to be the average distance of the 3 nearest neighbors
     pts = points.cpu().numpy()
     knn = NearestNeighbors(n_neighbors=4).fit(pts)  # 3 closest neighbors + the point itself
     distances, _ = knn.kneighbors(pts)  # distances shape: (N, 4)
-    dist = torch.from_numpy(distances[:, 1:]).float()  # 0th column is distance to itself
-    avg_dist = torch.sqrt(torch.square(dist).mean(axis=1))  # avg_dist shape: (N,)
+    dist2 = torch.square(
+        torch.from_numpy(distances[:, 1:]).float()
+    )  # 0th column is distance to itself
+    avg_dist = torch.sqrt(dist2.mean(axis=1)).unsqueeze(-1).repeat(1, 3)  # avg_dist shape: (N, 3)
     # in log space, after exp the values will be positive
-    scales = torch.log(avg_dist * init_scale).unsqueeze(-1).repeat(1, 3)
+    scales = torch.log(avg_dist * scale_probe)
 
     quaternions = torch.rand(N, 4)
     # in logit space, after sigmoid the values will be constrained in (0, 1)
