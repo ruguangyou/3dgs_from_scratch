@@ -1,11 +1,21 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+PYTHON_BIN="${PYTHON_BIN:-/home/yrg/miniconda3/envs/3dgs/bin/python}"
+SEEDS="${2:-3}"
+
+cd "${PROJECT_ROOT}"
+
 if [ "$1" = "train" ]; then
-    python3 -m scripts.train
+    PYTHONPATH="${PROJECT_ROOT}" "${PYTHON_BIN}" -m scripts.train
 elif [ "$1" = "evaluate" ]; then
-    python3 -m scripts.evaluate
+    PYTHONPATH="${PROJECT_ROOT}" "${PYTHON_BIN}" -m scripts.evaluate
 elif [ "$1" = "test" ]; then
-    python3 -m scripts.test
+    PYTHONPATH="${PROJECT_ROOT}" "${PYTHON_BIN}" -m scripts.test
 elif [ "$1" = "gradcheck" ]; then
-    ./scripts/check_cuda_gradients.sh "${2:-3}"
+    PYTHONPATH="${PROJECT_ROOT}" "${PYTHON_BIN}" -m scripts.check_cuda_gradients --seeds "${SEEDS}" --device cuda
 else
     echo "Usage: $0 {train|evaluate|test|gradcheck [seeds]}"
     exit 1
