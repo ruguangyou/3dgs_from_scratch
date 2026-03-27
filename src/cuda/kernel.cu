@@ -846,16 +846,12 @@ __global__ void compute_indexing_offset_kernel(
     // e.g. tile_ids_sorted=[1, 1, 2, 3, 3, 5], total_tiles=6, unique_tiles=8
     // then indexing_offset=[0, 0, 2, 3, 5, 5, 6, 6]
     // indexing_offset[tile_id] <= offset < indexing_offset[tile_id+1] give the range
+
+    // fill gap from the previous entry to the current entry
     if (idx == 0) {
-        // set offset of the tiles before the fisrt tile having gaussians to 0 (inclusive)
+        // set offset of the tiles before the first tile having gaussians to 0 (inclusive)
         for (int32_t i = 0; i <= tile_id; ++i) {
             indexing_offset[i] = 0;
-        }
-    }
-    else if (idx == total_tiles - 1) {
-        // set offset of the tiles after the last tile having gaussians to total_tiles
-        for (int32_t i = tile_id + 1; i < unique_tiles; ++i) {
-            indexing_offset[i] = total_tiles;
         }
     }
     else {
@@ -863,6 +859,13 @@ __global__ void compute_indexing_offset_kernel(
         int32_t prev_tile_id = (int32_t)(tile_ids_encoded_depth_sorted[idx - 1] >> 32);
         for (int32_t i = prev_tile_id + 1; i <= tile_id; ++i) {
             indexing_offset[i] = idx;
+        }
+    }
+
+    // fill tiles after the last entry
+    if (idx == total_tiles - 1) {
+        for (int32_t i = tile_id + 1; i < unique_tiles; ++i) {
+            indexing_offset[i] = total_tiles;
         }
     }
 }
