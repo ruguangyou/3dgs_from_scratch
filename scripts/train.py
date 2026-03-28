@@ -245,6 +245,7 @@ def train(
                 writer.add_scalar(
                     "train/opacity_mean", learnable_params["opacities"].mean().item(), step
                 )
+                writer.add_scalar("train/num_gaussians", learnable_params["means"].shape[0], step)
 
                 if step % tensorboard_image_interval == 0:
                     writer.add_image(

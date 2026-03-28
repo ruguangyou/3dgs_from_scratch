@@ -12,6 +12,7 @@ class Strategy:
     prune_scale = 0.1  # prune gaussians with scale above this threshold
     grow_grad = 0.0002  # grow new gaussians with gradient above this threshold
     split_scale = 0.01  # split gaussians with scale above this threshold, otherwise clone them
+    max_gaussians = 200000  # hard cap on total gaussian count to prevent OOM
 
     def __init__(self):
         self.grads = None
@@ -27,6 +28,8 @@ class Strategy:
             n_prune = self._prune_gaussians(learnable_params, optimizers, step)
             N = learnable_params["means"].shape[0]
             logging.info(f"Step {step}: pruned {n_prune} gaussians, remaining {N} gaussians")
+            # free GPU memory from pruned tensors immediately after pruning
+            torch.cuda.empty_cache()
 
             n_clone, n_split = self._grow_gaussians(learnable_params, optimizers)
             N = learnable_params["means"].shape[0]
@@ -37,7 +40,6 @@ class Strategy:
             # reset the state for the next round of refinement
             self.grads.zero_()
             self.count.zero_()
-            torch.cuda.empty_cache()
 
         if step > 0 and step % self.reset_every_n_steps == 0:
             self.reset_opacities(learnable_params, optimizers)
@@ -76,7 +78,9 @@ class Strategy:
         selection = torch.where(~is_prune)[0]
         for name in learnable_params.keys():
             param = learnable_params[name]
-            new_param = torch.nn.Parameter(param[selection], requires_grad=param.requires_grad)
+            new_param = torch.nn.Parameter(
+                param[selection].clone(), requires_grad=param.requires_grad
+            )
             learnable_params[name] = new_param
 
             optimizer = optimizers[name]
@@ -91,11 +95,14 @@ class Strategy:
                 del optimizer.state[param]
                 for key in state.keys():
                     if key != "step":
-                        state[key] = state[key][selection]
+                        state[key] = state[key][selection].clone()
                 optimizer.state[new_param] = state
 
-        self.grads = self.grads[selection]
-        self.count = self.count[selection]
+            # explicitly delete old param to release the GPU tensor immediately
+            del param
+
+        self.grads = self.grads[selection].clone()
+        self.count = self.count[selection].clone()
 
         return is_prune.sum().item()
 
@@ -104,6 +111,14 @@ class Strategy:
         grads = self.grads / self.count.clamp(min=1.0)  # (N,)
         scales = torch.exp(learnable_params["scales"])  # (N, 3)
         device = grads.device
+        N = learnable_params["means"].shape[0]
+
+        # enforce hard cap: if already at max, skip growing entirely
+        if N >= self.max_gaussians:
+            logging.warning(
+                f"Gaussian count {N} reached max_gaussians={self.max_gaussians}, skipping growth."
+            )
+            return 0, 0
 
         is_grad_high = grads > self.grow_grad
         is_gaussian_small = scales.max(dim=1).values < self.split_scale
@@ -111,6 +126,15 @@ class Strategy:
         is_split = is_grad_high & ~is_gaussian_small
         n_clone = is_clone.sum().item()
         n_split = is_split.sum().item()
+
+        # cap cloning to not exceed max_gaussians
+        budget = self.max_gaussians - N
+        if n_clone > budget:
+            selection_all = torch.where(is_clone)[0]
+            perm = torch.randperm(n_clone, device=device)[:budget]
+            is_clone = torch.zeros_like(is_clone)
+            is_clone[selection_all[perm]] = True
+            n_clone = budget
 
         if n_clone > 0:
             selection = torch.where(is_clone)[0]
@@ -137,6 +161,9 @@ class Strategy:
                                 dim=0,
                             )
                     optimizer.state[new_param] = state
+
+                # explicitly delete old param to release the GPU tensor immediately
+                del param
 
             self.grads = torch.cat([self.grads, self.grads[selection]], dim=0)
             self.count = torch.cat([self.count, self.count[selection]], dim=0)
@@ -191,6 +218,9 @@ class Strategy:
                                 dim=0,
                             )
                     optimizer.state[new_param] = state
+
+                # explicitly delete old param to release the GPU tensor immediately
+                del param
 
             self.grads = torch.cat([self.grads[rest], self.grads[selection].repeat(2)], dim=0)
             self.count = torch.cat([self.count[rest], self.count[selection].repeat(2)], dim=0)
