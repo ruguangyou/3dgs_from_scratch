@@ -7,15 +7,11 @@ from fused_ssim import fused_ssim
 from tqdm import tqdm
 from src.dataset import load_colmap, resize_camera, Dataset
 from src.gaussian import initialize, downsample_point_cloud
+from src.strategy import Strategy
 from torch.utils.tensorboard import SummaryWriter
 
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
-
-
-def ensure_finite(name, tensor):
-    if not torch.isfinite(tensor).all():
-        raise RuntimeError(f"Non-finite values detected in {name}.")
 
 
 def setup_optimizers(
@@ -56,10 +52,7 @@ def train(
     sh_degree_warmup_steps=1000,
     ssim_lambda=0.2,
     ssim_warmup_steps=3000,
-    grad_clip_norm=1.0,
-    scale_reg=0.01,
-    opacity_reset_interval=3000,
-    opacity_reset_value=0.01,
+    scale_reg=0,
     downsample_points=False,
     initial_max_points=100000,  # ignored if downsample_points is False
     load_cached_input=True,
@@ -105,9 +98,8 @@ def train(
         optimizers["means"], gamma=0.01 ** (1 / max_steps)
     )
 
-    means = learnable_params["means"]
-    sh_coeffs_dc = learnable_params["sh_coeffs_dc"]
-    sh_coeffs_rest = learnable_params["sh_coeffs_rest"]
+    # strategy for adaptive gaussian management
+    strategy = Strategy()
 
     if use_cuda_rasterizer:
         from src.cuda.wrapper import render
@@ -136,7 +128,8 @@ def train(
 
     logging.info("Training started...")
     try:
-        for step in tqdm(range(max_steps), desc="Training"):
+        pbar = tqdm(range(max_steps))
+        for step in pbar:
             # recalculate the intermediate variables that depend on the learnable parameters
             scales = torch.exp(learnable_params["scales"])
             quaternions = learnable_params["quaternions"]
@@ -144,10 +137,9 @@ def train(
                 1e-12
             )
             opacities = torch.sigmoid(learnable_params["opacities"])
-
-            ensure_finite("scales", scales)
-            ensure_finite("quaternions", quaternions)
-            ensure_finite("opacities", opacities)
+            means = learnable_params["means"]
+            sh_coeffs_dc = learnable_params["sh_coeffs_dc"]
+            sh_coeffs_rest = learnable_params["sh_coeffs_rest"]
 
             try:
                 camera = next(train_dataiter)
@@ -168,12 +160,13 @@ def train(
             world_to_camera = camera["world_to_camera"].squeeze(0).cuda()  # (4, 4)
             intrinsic = camera["intrinsic"].squeeze(0).cuda()  # (3, 3)
             target_image = camera["image"].squeeze(0).cuda()  # (H, W, C)
+            width, height = target_image.shape[1], target_image.shape[0]
 
-            rendered_image = render(
+            rendered_image, points_image, radii = render(
                 world_to_camera,
                 intrinsic,
-                target_image.shape[1],
-                target_image.shape[0],
+                width,
+                height,
                 means,
                 scales,
                 quaternions,
@@ -181,7 +174,10 @@ def train(
                 sh_coeffs_dc,
                 sh_coeffs_rest,
             )
-            ensure_finite("rendered_image", rendered_image)
+
+            if points_image is not None:
+                # retain gradients for points_image to adaptively control the number of gaussians
+                points_image.retain_grad()
 
             # Normalize to [0, 1] for loss computation.
             # render() outputs [0, 255] and target_image is also uint8 [0, 255].
@@ -206,24 +202,12 @@ def train(
                 effective_ssim_lambda = ssim_lambda
 
             loss = (1 - effective_ssim_lambda) * l1_loss + effective_ssim_lambda * ssim_loss
-            # Scale regularization: penalize large Gaussians (mirrors gsplat's scale_reg).
-            # Without a densification loop to prune oversized Gaussians, this is essential
-            # to prevent scale explosion in the CUDA rasterizer.
+
+            # Scale regularization to prevent scale explosion
             if scale_reg > 0.0:
                 loss = loss + scale_reg * scales.mean()
-            ensure_finite("loss", loss)
+
             loss.backward()
-
-            for name, param in learnable_params.items():
-                if param.grad is not None:
-                    ensure_finite(f"{name}.grad", param.grad)
-
-            # Clip gradients to prevent large-scale Gaussians from causing parameter explosion.
-            # When a Gaussian covers many pixels, du^2 terms in grad_cov_inv accumulate across
-            # all pixels via atomicAdd, potentially producing extremely large gradients.
-            if grad_clip_norm is not None and grad_clip_norm > 0:
-                all_params = list(learnable_params.values())
-                torch.nn.utils.clip_grad_norm_(all_params, grad_clip_norm)
 
             # increase SH degree every 1000 steps, to progressively learn higher frequency details
             sh_degree_to_use = min(sh_degree, step // sh_degree_warmup_steps)
@@ -236,24 +220,14 @@ def train(
                 optimizer.zero_grad()
             means_scheduler.step()
 
-            # Periodic opacity reset: force all Gaussians back to near-zero opacity,
-            # mimicking gsplat's DefaultStrategy reset_every=3000. Prevents bloated
-            # Gaussians from accumulating indefinitely without a full densification loop.
-            if opacity_reset_interval > 0 and step > 0 and step % opacity_reset_interval == 0:
-                with torch.no_grad():
-                    reset_logit = math.log(opacity_reset_value / (1.0 - opacity_reset_value))
-                    learnable_params["opacities"].fill_(reset_logit)
-                    # also reset the Adam second-moment to avoid stale momentum
-                    for key in ("opacities",):
-                        state = optimizers[key].state[learnable_params[key]]
-                        if "exp_avg" in state:
-                            state["exp_avg"].zero_()
-                        if "exp_avg_sq" in state:
-                            state["exp_avg_sq"].zero_()
-                logging.info(f"Step {step}: opacity reset to {opacity_reset_value}")
+            if points_image is not None and radii is not None:
+                strategy.adjust(
+                    learnable_params, optimizers, points_image, radii, width, height, step
+                )
 
-            for name, param in learnable_params.items():
-                ensure_finite(name, param)
+            pbar.set_description(
+                f"Step {step}: Loss={loss.item():.4f}, L1={l1_loss.item():.4f}, SSIM={ssim_loss.item():.4f}"
+            )
 
             if writer is not None:
                 writer.add_scalar("train/loss", loss.item(), step)
@@ -266,16 +240,13 @@ def train(
                     "train/scale_raw_max", learnable_params["scales"].max().item(), step
                 )
                 writer.add_scalar(
-                    "train/scale_raw_min", learnable_params["scales"].min().item(), step
-                )
-                writer.add_scalar(
                     "train/scale_raw_mean", learnable_params["scales"].mean().item(), step
                 )
-                writer.add_scalar("train/opacity_mean", opacities.mean().item(), step)
+                writer.add_scalar(
+                    "train/opacity_mean", learnable_params["opacities"].mean().item(), step
+                )
 
                 if step % tensorboard_image_interval == 0:
-                    writer.add_image("train/rendered", to_tb_image(rendered_image), step)
-                    writer.add_image("train/target", to_tb_image(target_image), step)
                     writer.add_image(
                         "train/concat",
                         to_tb_image(torch.cat([rendered_image, target_image], dim=1)),
@@ -295,14 +266,13 @@ def train(
                 "batch_size": batch_size,
                 "sh_degree": sh_degree,
                 "max_steps": max_steps,
+                "resolution_warmup_steps": resolution_warmup_steps,
                 "sh_degree_warmup_steps": sh_degree_warmup_steps,
                 "ssim_lambda": ssim_lambda,
                 "ssim_warmup_steps": ssim_warmup_steps,
-                "grad_clip_norm": grad_clip_norm,
                 "scale_reg": scale_reg,
-                "opacity_reset_interval": opacity_reset_interval,
-                "opacity_reset_value": opacity_reset_value,
-                "initial_max_points": initial_max_points,
+                "initial_max_points": initial_max_points if downsample_points else 0,
+                "use_cuda_rasterizer": use_cuda_rasterizer,
             },
         },
         f"logs/trained_gaussians_{max_steps}.pth",
@@ -312,12 +282,9 @@ def train(
 
 if __name__ == "__main__":
     train(
-        max_steps=5000,
+        max_steps=30000,
         downsample_points=False,
         initial_max_points=50000,
         use_cuda_rasterizer=True,
         ssim_warmup_steps=3000,
-        grad_clip_norm=1.0,
-        scale_reg=0.01,
-        opacity_reset_interval=0,
     )

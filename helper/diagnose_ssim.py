@@ -53,7 +53,7 @@ def main():
     # CUDA path - SSIM only
     p1 = clone_params()
     s1, q1, o1 = prepare(p1)
-    img_cuda = cuda_render(
+    img_cuda, _, _ = cuda_render(
         w2c, intrinsic, W, H, p1["means"], s1, q1, o1, p1["sh_coeffs_dc"], p1["sh_coeffs_rest"]
     )
     img_cuda.register_hook(hook_factory("cuda"))
@@ -67,7 +67,7 @@ def main():
     # Torch path - SSIM only
     p2 = clone_params()
     s2, q2, o2 = prepare(p2)
-    img_torch = torch_render(
+    img_torch, _, _ = torch_render(
         w2c, intrinsic, W, H, p2["means"], s2, q2, o2, p2["sh_coeffs_dc"], p2["sh_coeffs_rest"]
     )
     img_torch.register_hook(hook_factory("torch"))
@@ -108,7 +108,7 @@ def main():
     print(f"\n--- Cross-check: SSIM grad from torch image → cuda backward ---")
     p3 = clone_params()
     s3, q3, o3 = prepare(p3)
-    img3 = cuda_render(
+    img3, _, _ = cuda_render(
         w2c, intrinsic, W, H, p3["means"], s3, q3, o3, p3["sh_coeffs_dc"], p3["sh_coeffs_rest"]
     )
     # use the torch gradient as upstream

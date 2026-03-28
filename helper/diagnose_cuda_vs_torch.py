@@ -48,7 +48,7 @@ def compare_forward():
     opac = torch.sigmoid(params["opacities"])
 
     with torch.no_grad():
-        img_cuda = cuda_render(
+        img_cuda, _, _ = cuda_render(
             w2c,
             K,
             W,
@@ -60,7 +60,7 @@ def compare_forward():
             params["sh_coeffs_dc"],
             params["sh_coeffs_rest"],
         )
-        img_torch = torch_render(
+        img_torch, _, _ = torch_render(
             w2c,
             K,
             W,

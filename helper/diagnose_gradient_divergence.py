@@ -45,7 +45,7 @@ def main():
     # forward comparison
     p1 = clone_params()
     s1, q1, o1 = prepare(p1)
-    img_cuda = cuda_render(
+    img_cuda, _, _ = cuda_render(
         w2c, intrinsic, W, H, p1["means"], s1, q1, o1, p1["sh_coeffs_dc"], p1["sh_coeffs_rest"]
     )
 

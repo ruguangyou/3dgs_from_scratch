@@ -41,7 +41,7 @@ def test(use_cuda_rasterizer=True):
             w2c[3, 3] = 1.0
 
             print("rendering frame", i)
-            img = render(
+            img, _, _ = render(
                 w2c,
                 intrinsic,
                 width,

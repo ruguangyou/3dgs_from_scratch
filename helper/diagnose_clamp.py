@@ -45,10 +45,10 @@ def main():
     p0 = clone_params()
     s0, q0, o0 = prepare(p0)
     with torch.no_grad():
-        img_cuda = cuda_render(
+        img_cuda, _, _ = cuda_render(
             w2c, intrinsic, W, H, p0["means"], s0, q0, o0, p0["sh_coeffs_dc"], p0["sh_coeffs_rest"]
         )
-        img_torch = torch_render(
+        img_torch, _, _ = torch_render(
             w2c, intrinsic, W, H, p0["means"], s0, q0, o0, p0["sh_coeffs_dc"], p0["sh_coeffs_rest"]
         )
 
@@ -74,7 +74,7 @@ def main():
     # CUDA with clamp (like torch)
     p1 = clone_params()
     s1, q1, o1 = prepare(p1)
-    img1 = cuda_render(
+    img1, _, _ = cuda_render(
         w2c, intrinsic, W, H, p1["means"], s1, q1, o1, p1["sh_coeffs_dc"], p1["sh_coeffs_rest"]
     )
     loss1 = compute_ssim_loss(img1, target)
@@ -83,7 +83,7 @@ def main():
     # Torch (already has clamp)
     p2 = clone_params()
     s2, q2, o2 = prepare(p2)
-    img2 = torch_render(
+    img2, _, _ = torch_render(
         w2c, intrinsic, W, H, p2["means"], s2, q2, o2, p2["sh_coeffs_dc"], p2["sh_coeffs_rest"]
     )
     loss2 = compute_ssim_loss(img2, target)

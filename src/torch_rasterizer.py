@@ -266,4 +266,8 @@ def render(
 
         rendered_image[v0:v1, u0:u1, :] = contribution
 
-    return rendered_image.clamp(0, 1) * 255
+    return (
+        rendered_image.clamp(0, 1) * 255,
+        None,
+        None,
+    )  # for compatibility with CUDA rasterizer output

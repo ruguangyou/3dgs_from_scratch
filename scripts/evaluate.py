@@ -40,7 +40,7 @@ def evaluate(ckpt_path, use_cuda_rasterizer=True):
         intrinsic = camera["intrinsic"].squeeze(0).cuda()  # (3, 3)
         target_image = camera["image"].squeeze(0).cuda()  # (H, W, C)
 
-        rendered_image = render(
+        rendered_image, _, _ = render(
             world_to_camera,
             intrinsic,
             target_image.shape[1],

@@ -64,7 +64,7 @@ def main():
     print("=== Test 1: Direct SSIM (failing case) ===")
     p1 = clone_params()
     s1, q1, o1 = prepare(p1)
-    img1 = cuda_render(
+    img1, _, _ = cuda_render(
         w2c, intrinsic, W, H, p1["means"], s1, q1, o1, p1["sh_coeffs_dc"], p1["sh_coeffs_rest"]
     )
     img1.register_hook(hook_factory("test1_img"))
@@ -84,7 +84,7 @@ def main():
     print("\n=== Test 2: With /255*255 wrapper (working case) ===")
     p2 = clone_params()
     s2, q2, o2 = prepare(p2)
-    img2_raw = cuda_render(
+    img2_raw, _, _ = cuda_render(
         w2c, intrinsic, W, H, p2["means"], s2, q2, o2, p2["sh_coeffs_dc"], p2["sh_coeffs_rest"]
     )
     img2_raw.register_hook(hook_factory("test2_raw"))
@@ -101,7 +101,7 @@ def main():
     print("\n=== Test 3: Direct SSIM with img.contiguous() ===")
     p3 = clone_params()
     s3, q3, o3 = prepare(p3)
-    img3 = cuda_render(
+    img3, _, _ = cuda_render(
         w2c, intrinsic, W, H, p3["means"], s3, q3, o3, p3["sh_coeffs_dc"], p3["sh_coeffs_rest"]
     )
     img3.register_hook(hook_factory("test3_img"))
@@ -116,7 +116,7 @@ def main():
     print("\n=== Comparing parameter gradients ===")
     p_ref = clone_params()
     s_ref, q_ref, o_ref = prepare(p_ref)
-    img_ref = torch_render(
+    img_ref, _, _ = torch_render(
         w2c,
         intrinsic,
         W,

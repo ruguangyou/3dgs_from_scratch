@@ -272,4 +272,4 @@ def render(
     )
 
     # clamp to [0, 1] before scaling
-    return rendered_image.clamp(0, 1) * 255
+    return rendered_image.clamp(0, 1) * 255, points_img, radii
