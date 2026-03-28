@@ -5,7 +5,7 @@ from datetime import datetime
 import torch
 from fused_ssim import fused_ssim
 from tqdm import tqdm
-from src.dataset import load_colmap, Dataset
+from src.dataset import load_colmap, resize_camera, Dataset
 from src.gaussian import initialize, downsample_point_cloud
 from torch.utils.tensorboard import SummaryWriter
 
@@ -52,7 +52,8 @@ def train(
     batch_size=1,
     sh_degree=3,
     max_steps=30000,
-    sh_degree_increase_step=1000,
+    resolution_warmup_steps=250,
+    sh_degree_warmup_steps=1000,
     ssim_lambda=0.2,
     ssim_warmup_steps=3000,
     grad_clip_norm=1.0,
@@ -61,7 +62,6 @@ def train(
     opacity_reset_value=0.01,
     downsample_points=False,
     initial_max_points=100000,  # ignored if downsample_points is False
-    image_scale=0.5,
     load_cached_input=True,
     use_cuda_rasterizer=True,
     use_tensorboard=True,
@@ -87,7 +87,7 @@ def train(
             initial_max_points,
         )
 
-    train_dataset = Dataset(camera_data, image_scale=image_scale, split="train")
+    train_dataset = Dataset(camera_data, split="train")
     train_dataloader = torch.utils.data.DataLoader(
         train_dataset, batch_size=batch_size, shuffle=True
     )
@@ -123,7 +123,7 @@ def train(
             (
                 f"batch_size={batch_size}, sh_degree={sh_degree}, max_steps={max_steps}, "
                 f"ssim_lambda={ssim_lambda}, ssim_warmup_steps={ssim_warmup_steps}, "
-                f"image_scale={image_scale}, use_cuda_rasterizer={use_cuda_rasterizer}"
+                f"use_cuda_rasterizer={use_cuda_rasterizer}"
             ),
         )
 
@@ -154,6 +154,15 @@ def train(
             except StopIteration:
                 train_dataiter = iter(train_dataloader)
                 camera = next(train_dataiter)
+
+            if resolution_warmup_steps > 0:
+                if step < resolution_warmup_steps:
+                    warmup_scale = 0.25
+                elif step < 2 * resolution_warmup_steps:
+                    warmup_scale = 0.5
+                else:
+                    warmup_scale = 1.0
+                camera = resize_camera(camera, warmup_scale)
 
             # batch size is 1, so squeeze the batch dimension
             world_to_camera = camera["world_to_camera"].squeeze(0).cuda()  # (4, 4)
@@ -217,7 +226,7 @@ def train(
                 torch.nn.utils.clip_grad_norm_(all_params, grad_clip_norm)
 
             # increase SH degree every 1000 steps, to progressively learn higher frequency details
-            sh_degree_to_use = min(sh_degree, step // sh_degree_increase_step)
+            sh_degree_to_use = min(sh_degree, step // sh_degree_warmup_steps)
             # zero out gradients for unused SH coefficients
             if sh_degree_to_use < sh_degree:
                 sh_coeffs_rest.grad[:, (sh_degree_to_use + 1) ** 2 - 1 :, :].zero_()
@@ -286,7 +295,7 @@ def train(
                 "batch_size": batch_size,
                 "sh_degree": sh_degree,
                 "max_steps": max_steps,
-                "sh_degree_increase_step": sh_degree_increase_step,
+                "sh_degree_warmup_steps": sh_degree_warmup_steps,
                 "ssim_lambda": ssim_lambda,
                 "ssim_warmup_steps": ssim_warmup_steps,
                 "grad_clip_norm": grad_clip_norm,
@@ -294,7 +303,6 @@ def train(
                 "opacity_reset_interval": opacity_reset_interval,
                 "opacity_reset_value": opacity_reset_value,
                 "initial_max_points": initial_max_points,
-                "image_scale": image_scale,
             },
         },
         f"logs/trained_gaussians_{max_steps}.pth",

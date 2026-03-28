@@ -18,12 +18,11 @@ def evaluate(ckpt_path, use_cuda_rasterizer=True):
     opacities = checkpoint["learnable_params"]["opacities"].cuda()
     sh_coeffs_dc = checkpoint["learnable_params"]["sh_coeffs_dc"].cuda()
     sh_coeffs_rest = checkpoint["learnable_params"]["sh_coeffs_rest"].cuda()
-    image_scale = checkpoint["training_config"]["image_scale"]
 
     # load camera data for evaluation
     with open("colmap_data/input_data.pkl", "rb") as f:
         camera_data, _, _ = pickle.load(f)
-    eval_dataset = Dataset(camera_data, image_scale=image_scale, split="eval")
+    eval_dataset = Dataset(camera_data, split="eval")
     eval_dataloader = torch.utils.data.DataLoader(
         eval_dataset,
         batch_size=1,
