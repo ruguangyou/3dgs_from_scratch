@@ -14,6 +14,7 @@ Core directories:
 - `src/`: core implementation (data loading, Gaussian params, training strategy, Torch rasterizer, CUDA wrapper)
 - `src/cuda/`: CUDA/C++ extension source
 - `scripts/`: entry points for training, evaluation, test rendering, and gradient checks
+- `scripts/benchmark_rasterizers.py`: training benchmark for Torch vs CUDA rasterizers
 - `colmap_data/`: COLMAP data directory (input)
 - `logs/`: checkpoints, eval images, TensorBoard logs, test inputs and outputs
 - `run.sh`: unified command entry script
@@ -60,6 +61,7 @@ On first training run, parsed inputs are cached to `colmap_data/input_data.pkl`.
 - Evaluation entry is in `scripts/evaluate.py`.
 - Test rendering entry is in `scripts/test.py`.
 - CUDA gradient check entry is in `scripts/check_cuda_gradients.py`.
+- Rasterizer benchmark entry is in `scripts/benchmark_rasterizers.py`.
 
 Use the root script for all workflows:
 
@@ -70,6 +72,26 @@ Use the root script for all workflows:
 ./run.sh gradcheck          # default seeds=3
 ./run.sh gradcheck 5        # custom seed count
 ```
+
+Benchmark Torch vs CUDA rasterizers during training:
+
+```bash
+./run.sh benchmark --max-steps 100 --repeats 3
+```
+
+Notes:
+
+- If `colmap_data/input_data.pkl` does not exist yet, run one training pass first, or add `--no-load-cached-input`.
+- The benchmark disables checkpoint saving to reduce I/O noise.
+- For a more representative full-training comparison, use a larger `--max-steps` (for example, >500 so densification/pruning can start).
+
+The benchmark reports:
+
+- total training time
+- average per-step time
+- peak GPU memory allocated
+- peak GPU memory reserved
+- percentage improvement of CUDA relative to Torch
 
 To override the interpreter:
 

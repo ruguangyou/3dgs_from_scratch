@@ -60,6 +60,7 @@ def train(
     use_tensorboard=True,
     tensorboard_log_dir="logs/tensorboard",
     tensorboard_image_interval=100,
+    save_checkpoint=True,
 ):
     data_dir = "colmap_data"
     if load_cached_input:
@@ -257,28 +258,31 @@ def train(
         if writer is not None:
             writer.close()
 
-    # save the learned parameters and training configuration for later use
-    torch.save(
-        {
-            "learnable_params": learnable_params.state_dict(),
-            "optimizers": {name: optimizer.state_dict() for name, optimizer in optimizers.items()},
-            "means_scheduler": means_scheduler.state_dict(),
-            "training_config": {
-                "batch_size": batch_size,
-                "sh_degree": sh_degree,
-                "max_steps": max_steps,
-                "resolution_warmup_steps": resolution_warmup_steps,
-                "sh_degree_warmup_steps": sh_degree_warmup_steps,
-                "ssim_lambda": ssim_lambda,
-                "ssim_warmup_steps": ssim_warmup_steps,
-                "scale_reg": scale_reg,
-                "initial_max_points": initial_max_points if downsample_points else 0,
-                "use_cuda_rasterizer": use_cuda_rasterizer,
+    if save_checkpoint:
+        # save the learned parameters and training configuration for later use
+        torch.save(
+            {
+                "learnable_params": learnable_params.state_dict(),
+                # "optimizers": {name: optimizer.state_dict() for name, optimizer in optimizers.items()},
+                # "means_scheduler": means_scheduler.state_dict(),
+                "training_config": {
+                    "batch_size": batch_size,
+                    "sh_degree": sh_degree,
+                    "max_steps": max_steps,
+                    "resolution_warmup_steps": resolution_warmup_steps,
+                    "sh_degree_warmup_steps": sh_degree_warmup_steps,
+                    "ssim_lambda": ssim_lambda,
+                    "ssim_warmup_steps": ssim_warmup_steps,
+                    "scale_reg": scale_reg,
+                    "initial_max_points": initial_max_points if downsample_points else 0,
+                    "use_cuda_rasterizer": use_cuda_rasterizer,
+                },
             },
-        },
-        f"logs/trained_gaussians_{max_steps}.pth",
-    )
-    logging.info("Training completed and model saved.")
+            f"logs/trained_gaussians_{max_steps}.pth",
+        )
+        logging.info("Training completed and model saved.")
+    else:
+        logging.info("Training completed.")
 
 
 if __name__ == "__main__":

@@ -12,7 +12,7 @@ class Strategy:
     prune_scale = 0.1  # prune gaussians with scale above this threshold
     grow_grad = 0.0002  # grow new gaussians with gradient above this threshold
     split_scale = 0.01  # split gaussians with scale above this threshold, otherwise clone them
-    max_gaussians = 200000  # hard cap on total gaussian count to prevent OOM
+    max_gaussians = 1000000  # hard cap on total gaussian count to prevent OOM
 
     def __init__(self):
         self.grads = None
