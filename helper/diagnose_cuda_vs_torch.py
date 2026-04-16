@@ -201,6 +201,7 @@ def compare_intermediate():
         sh_dc.contiguous(),
         sh_rest.contiguous(),
         mask_c.contiguous(),
+        False,
     )
 
     # --- Torch intermediate ---

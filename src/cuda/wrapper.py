@@ -38,6 +38,8 @@ class ProjectPointsFunction(torch.autograd.Function):
         ctx.save_for_backward(
             means, scales, quaternions, opacities, world_to_camera, intrinsic, cov_img, mask
         )
+        ctx.width = width
+        ctx.height = height
         return points_img, depths, cov_inv_img, radii, mask
 
     @staticmethod
@@ -54,6 +56,8 @@ class ProjectPointsFunction(torch.autograd.Function):
             opacities.contiguous(),
             world_to_camera.contiguous(),
             intrinsic.contiguous(),
+            ctx.width,
+            ctx.height,
             cov_img.contiguous(),
             mask.contiguous(),
         )

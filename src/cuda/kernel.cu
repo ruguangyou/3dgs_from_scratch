@@ -20,6 +20,8 @@ constexpr float SH_C3_zzz_zxx_zyy = 0.3731763325901154;
 constexpr float SH_C3_xzz_xxx_xyy = 0.4570457994644658;
 constexpr float SH_C3_zxx_zyy = 1.445305721320277;
 constexpr float SH_C3_xxx_xyy = 0.5900435899266435;
+constexpr float LOW_PASS_FILTER = 0.3f;
+constexpr float FRUSTUM_CLAMP_FACTOR = 1.3f;
 
 __device__ void transform_w2c(
     const float *world_to_camera,
@@ -43,6 +45,8 @@ __device__ void transform_w2c(
 __device__ void transform_cov_w2c2i(
     const float *W,  // world_to_camera (4*4,)
     const float *K,  // intrinsic (3*3,)
+    const int32_t width,
+    const int32_t height,
     const float *scale,
     const float *quaternion,
     const float3 &point_camera,
@@ -105,11 +109,20 @@ __device__ void transform_cov_w2c2i(
     float x = point_camera.x;
     float y = point_camera.y;
     float z = point_camera.z;
+    float fx = K[0];
+    float fy = K[4];
+    float cx = K[2];
+    float cy = K[5];
+    float lim_x = FRUSTUM_CLAMP_FACTOR * fmaxf(cx, (float)width - cx) / fx;
+    float lim_y = FRUSTUM_CLAMP_FACTOR * fmaxf(cy, (float)height - cy) / fy;
     float inv_z = 1.0f / z;
-    float inv_z2 = inv_z * inv_z;
+    float x_ndc = x * inv_z;
+    float y_ndc = y * inv_z;
+    float x_ndc_clamped = fminf(lim_x, fmaxf(-lim_x, x_ndc));
+    float y_ndc_clamped = fminf(lim_y, fmaxf(-lim_y, y_ndc));
     float J[6] = {
-        K[0] * inv_z, 0, -K[0] * x * inv_z2,
-        0, K[4] * inv_z, -K[4] * y * inv_z2
+        fx * inv_z, 0, -fx * x_ndc_clamped * inv_z,
+        0, fy * inv_z, -fy * y_ndc_clamped * inv_z
     };
     
     // cov_image = J * cov_camera * J^T
@@ -135,15 +148,17 @@ __device__ void transform_cov_w2c2i(
     };
 
     // ensure symmetry
-    cov_image[0] = Ci[0];
+    cov_image[0] = Ci[0] + LOW_PASS_FILTER;
     cov_image[1] = 0.5f * (Ci[1] + Ci[2]);
-    cov_image[2] = Ci[3];
+    cov_image[2] = Ci[3] + LOW_PASS_FILTER;
 }
 
 __device__ void grad_projection_and_covariance(
     const float3 &point_camera,
     const float *W,
     const float *K,
+    const int32_t width,
+    const int32_t height,
     const float *grad_points_image,
     const float *scale,
     const float *quaternion,
@@ -156,17 +171,30 @@ __device__ void grad_projection_and_covariance(
     float x = point_camera.x;
     float y = point_camera.y;
     float z = point_camera.z;
+    float fx = K[0];
+    float fy = K[4];
+    float cx = K[2];
+    float cy = K[5];
+    float lim_x = FRUSTUM_CLAMP_FACTOR * fmaxf(cx, (float)width - cx) / fx;
+    float lim_y = FRUSTUM_CLAMP_FACTOR * fmaxf(cy, (float)height - cy) / fy;
     float inv_z = 1.0f / z;
     float inv_z2 = inv_z * inv_z;
+    float inv_z3 = inv_z2 * inv_z;
+    float x_ndc = x * inv_z;
+    float y_ndc = y * inv_z;
+    float x_ndc_clamped = fminf(lim_x, fmaxf(-lim_x, x_ndc));
+    float y_ndc_clamped = fminf(lim_y, fmaxf(-lim_y, y_ndc));
+    bool x_is_clamped = fabsf(x_ndc) > lim_x;
+    bool y_is_clamped = fabsf(y_ndc) > lim_y;
 
     float grad_u = grad_points_image[0];
     float grad_v = grad_points_image[1];
     grad_points_world[0] =
-        (grad_u * K[0] * (W[0] * z - W[8] * x) + grad_v * K[4] * (W[4] * z - W[8] * y)) * inv_z2;
+        (grad_u * fx * (W[0] * z - W[8] * x) + grad_v * fy * (W[4] * z - W[8] * y)) * inv_z2;
     grad_points_world[1] =
-        (grad_u * K[0] * (W[1] * z - W[9] * x) + grad_v * K[4] * (W[5] * z - W[9] * y)) * inv_z2;
+        (grad_u * fx * (W[1] * z - W[9] * x) + grad_v * fy * (W[5] * z - W[9] * y)) * inv_z2;
     grad_points_world[2] =
-        (-grad_u * K[0] * (W[10] * x - W[2] * z) - grad_v * K[4] * (W[10] * y - W[6] * z)) * inv_z2;
+        (-grad_u * fx * (W[10] * x - W[2] * z) - grad_v * fy * (W[10] * y - W[6] * z)) * inv_z2;
 
     // E' = J * W * E * W^T * J^T
     //    = (J * W) * ((R * S) * S * R^T) * W^T * J^T
@@ -178,8 +206,8 @@ __device__ void grad_projection_and_covariance(
 
     // Jacobian of perspective projection
     float J[6] = {
-        K[0] * inv_z, 0, -K[0] * x * inv_z2,
-        0, K[4] * inv_z, -K[4] * y * inv_z2
+        fx * inv_z, 0, -fx * x_ndc_clamped * inv_z,
+        0, fy * inv_z, -fy * y_ndc_clamped * inv_z
     };
 
     // U = J * W
@@ -364,17 +392,15 @@ __device__ void grad_projection_and_covariance(
     float dLdJ_11 = 2.0f * (GJ_10 * Cc[1] + GJ_11 * Cc[4] + GJ_12 * Cc[7]);
     float dLdJ_12 = 2.0f * (GJ_10 * Cc[2] + GJ_11 * Cc[5] + GJ_12 * Cc[8]);
 
-    float inv_z3 = inv_z2 * inv_z;
-
-    float fx = K[0];
-    float fy = K[4];
-    float grad_x_cam = dLdJ_02 * (-fx * inv_z2);
-    float grad_y_cam = dLdJ_12 * (-fy * inv_z2);
+    float grad_x_cam = x_is_clamped ? 0.0f : dLdJ_02 * (-fx * inv_z2);
+    float grad_y_cam = y_is_clamped ? 0.0f : dLdJ_12 * (-fy * inv_z2);
+    float dJ02_dz = x_is_clamped ? (fx * x_ndc_clamped * inv_z2) : (2.0f * fx * x * inv_z3);
+    float dJ12_dz = y_is_clamped ? (fy * y_ndc_clamped * inv_z2) : (2.0f * fy * y * inv_z3);
     float grad_z_cam =
         dLdJ_00 * (-fx * inv_z2) +
         dLdJ_11 * (-fy * inv_z2) +
-        dLdJ_02 * (2.0f * fx * x * inv_z3) +
-        dLdJ_12 * (2.0f * fy * y * inv_z3);
+        dLdJ_02 * dJ02_dz +
+        dLdJ_12 * dJ12_dz;
 
     grad_points_world[0] += W[0] * grad_x_cam + W[4] * grad_y_cam + W[8] * grad_z_cam;
     grad_points_world[1] += W[1] * grad_x_cam + W[5] * grad_y_cam + W[9] * grad_z_cam;
@@ -430,6 +456,8 @@ __global__ void project_points_kernel(
     transform_cov_w2c2i(
         world_to_camera,
         intrinsic,
+        width,
+        height,
         &scales[idx*3],
         &quaternions[idx*4],
         point_camera,
@@ -482,6 +510,8 @@ __global__ void project_points_backward_kernel(
     const float *intrinsic,  // (3*3,)
     const float *cov_image,  // (N*3,)
     const bool *mask,  // (N,)
+    const int32_t width,
+    const int32_t height,
     float *grad_points_world,  // (N*3,)
     float *grad_scales,  // (N*3,)
     float *grad_quaternions  // (N*4,)
@@ -498,6 +528,8 @@ __global__ void project_points_backward_kernel(
         point_camera,
         world_to_camera,
         intrinsic,
+        width,
+        height,
         &grad_points_image[idx*2],
         &scales[idx*3],
         &quaternions[idx*4],
@@ -1139,6 +1171,8 @@ void launch_project_points_backward_kernel(
     const torch::Tensor intrinsic,  // (3, 3)
     const torch::Tensor cov_image,  // (N, 3)
     const torch::Tensor mask,  // (N,)
+    const int32_t width,
+    const int32_t height,
     torch::Tensor grad_points_world,  // (N, 3)
     torch::Tensor grad_scales,  // (N, 3)
     torch::Tensor grad_quaternions  // (N, 4)
@@ -1162,6 +1196,8 @@ void launch_project_points_backward_kernel(
         intrinsic.data_ptr<float>(),
         cov_image.data_ptr<float>(),
         mask.data_ptr<bool>(),
+        width,
+        height,
         grad_points_world.data_ptr<float>(),
         grad_scales.data_ptr<float>(),
         grad_quaternions.data_ptr<float>()

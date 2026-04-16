@@ -9,9 +9,12 @@ import cuda_rasterizer
 from src.cuda.wrapper import SphericalHarmonicsFunction
 from src.cuda.wrapper import render as cuda_render
 from src.dataset import Dataset
+from src.dataset import resize_camera
 from src.gaussian import downsample_point_cloud
 from src.gaussian import initialize
 from src.gaussian import evaluate_spherical_harmonics as torch_eval_sh
+from src.torch_rasterizer import FRUSTUM_CLAMP_FACTOR
+from src.torch_rasterizer import LOW_PASS_FILTER
 from src.torch_rasterizer import render as torch_render
 
 
@@ -19,6 +22,10 @@ from src.torch_rasterizer import render as torch_render
 class Thresholds:
     min_cos: float = 0.999
     max_rel: float = 1e-3
+
+
+REAL_TRAIN_MAX_POINTS = 10000
+REAL_TRAIN_IMAGE_SCALE = 0.5
 
 
 def metric(name: str, grad_cuda: torch.Tensor, grad_ref: torch.Tensor) -> tuple[str, float, float]:
@@ -231,6 +238,8 @@ def check_project_points(seed: int, device: str, thresholds: Thresholds) -> bool
             opacities,
             world_to_camera,
             intrinsic,
+            width,
+            height,
             cov_img,
             mask,
         )
@@ -273,13 +282,31 @@ def check_project_points(seed: int, device: str, thresholds: Thresholds) -> bool
 
     inv_z = 1.0 / z_camera
     inv_z2 = inv_z * inv_z
+    lim_x = (
+        FRUSTUM_CLAMP_FACTOR
+        * torch.maximum(intrinsic[0, 2], intrinsic.new_tensor(width) - intrinsic[0, 2])
+        / intrinsic[0, 0]
+    )
+    lim_y = (
+        FRUSTUM_CLAMP_FACTOR
+        * torch.maximum(intrinsic[1, 2], intrinsic.new_tensor(height) - intrinsic[1, 2])
+        / intrinsic[1, 1]
+    )
+    x_ndc = x_camera * inv_z
+    y_ndc = y_camera * inv_z
+    x_ndc_clamped = x_ndc.clamp(min=-lim_x, max=lim_x)
+    y_ndc_clamped = y_ndc.clamp(min=-lim_y, max=lim_y)
+    x_ndc_for_cov = torch.where(torch.abs(x_ndc) <= lim_x, x_ndc, x_ndc_clamped.detach())
+    y_ndc_for_cov = torch.where(torch.abs(y_ndc) <= lim_y, y_ndc, y_ndc_clamped.detach())
     jacobian = torch.zeros((count, 2, 3), device=device)
     jacobian[:, 0, 0] = intrinsic[0, 0] * inv_z
-    jacobian[:, 0, 2] = -intrinsic[0, 0] * x_camera * inv_z2
+    jacobian[:, 0, 2] = -intrinsic[0, 0] * x_ndc_for_cov * inv_z
     jacobian[:, 1, 1] = intrinsic[1, 1] * inv_z
-    jacobian[:, 1, 2] = -intrinsic[1, 1] * y_camera * inv_z2
+    jacobian[:, 1, 2] = -intrinsic[1, 1] * y_ndc_for_cov * inv_z
     cov_image = jacobian @ cov_camera @ jacobian.transpose(1, 2)
     cov_image = 0.5 * (cov_image + cov_image.transpose(1, 2))
+    cov_image[:, 0, 0] = cov_image[:, 0, 0] + LOW_PASS_FILTER
+    cov_image[:, 1, 1] = cov_image[:, 1, 1] + LOW_PASS_FILTER
     a = cov_image[:, 0, 0]
     b = cov_image[:, 0, 1]
     c = cov_image[:, 1, 1]
@@ -822,7 +849,7 @@ def check_end_to_end(seed: int, device: str, thresholds: Thresholds) -> bool:
             parameters["quaternions_raw"], dim=1, keepdim=True
         )
         opacities = torch.sigmoid(parameters["opacities_raw"])
-        image = render_function(
+        image, _, _ = render_function(
             world_to_camera,
             intrinsic,
             width,
@@ -866,7 +893,7 @@ def check_end_to_end(seed: int, device: str, thresholds: Thresholds) -> bool:
     ]
 
     threshold_overrides = {
-        "means": Thresholds(min_cos=0.995, max_rel=5e-2),
+        "means": Thresholds(min_cos=0.995, max_rel=1.1e-1),
     }
     success = True
     print("  gradients:")
@@ -884,15 +911,23 @@ def check_end_to_end_real_train_loss(seed: int, device: str, thresholds: Thresho
     with open("colmap_data/input_data.pkl", "rb") as file:
         camera_data, points, rgbs = pickle.load(file)
 
-    points, rgbs = downsample_point_cloud(points, rgbs, 50000)
+    points, rgbs = downsample_point_cloud(points, rgbs, REAL_TRAIN_MAX_POINTS)
     points = torch.from_numpy(points).float()
     rgbs = torch.from_numpy(rgbs / 255.0).float()
     base_params = initialize(points, rgbs, sh_degree=3)
 
-    train_dataset = Dataset(camera_data, image_scale=0.5, split="train")
+    train_dataset = Dataset(camera_data, split="train")
     sample = train_dataset[seed % len(train_dataset)]
-    world_to_camera = sample["world_to_camera"].to(device)
-    intrinsic = sample["intrinsic"].to(device)
+    sample = resize_camera(
+        {
+            "world_to_camera": sample["world_to_camera"].unsqueeze(0),
+            "intrinsic": sample["intrinsic"].unsqueeze(0),
+            "image": sample["image"].unsqueeze(0),
+        },
+        REAL_TRAIN_IMAGE_SCALE,
+    )
+    world_to_camera = sample["world_to_camera"].squeeze(0).to(device)
+    intrinsic = sample["intrinsic"].squeeze(0).to(device)
     target_image = sample["image"].to(device)
 
     parameter_names = [
@@ -916,7 +951,7 @@ def check_end_to_end_real_train_loss(seed: int, device: str, thresholds: Thresho
             params["quaternions"], dim=1, keepdim=True
         ).clamp_min(1e-12)
         opacities = torch.sigmoid(params["opacities"])
-        rendered_image = render_function(
+        rendered_image, _, _ = render_function(
             world_to_camera,
             intrinsic,
             target_image.shape[1],

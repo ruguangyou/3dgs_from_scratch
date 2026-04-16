@@ -2,6 +2,10 @@ import torch
 from src.gaussian import evaluate_spherical_harmonics, quaternion_to_rotation_matrix
 
 
+LOW_PASS_FILTER = 0.3
+FRUSTUM_CLAMP_FACTOR = 1.3
+
+
 def render(
     world_to_camera,
     intrinsic,
@@ -50,7 +54,7 @@ def render(
     sh_coeffs_rest = sh_coeffs_rest[valid_depth_mask]  # (M, 15, 3)
     M = points_cam.shape[1]
     if M == 0:
-        return torch.zeros((height, width, 3), device=means.device, dtype=means.dtype)
+        return torch.zeros((height, width, 3), device=means.device, dtype=means.dtype), None, None
 
     # evaluate spherical harmonics at the view direction
     camera_pos = -world_to_camera[:3, :3].t() @ world_to_camera[:3, 3]  # (3,)
@@ -77,14 +81,24 @@ def render(
     # project Gaussian covariances to image plane
     J = torch.zeros((M, 2, 3), device=means.device)  # Jacobian of projection
     fx, fy = intrinsic[0, 0], intrinsic[1, 1]
+    cx, cy = intrinsic[0, 2], intrinsic[1, 2]
     x, y, z = points_cam.unbind(0)  # (M,)
     invz = 1 / z
-    invz2 = invz * invz
+    lim_x = FRUSTUM_CLAMP_FACTOR * max(cx, width - cx) / fx
+    lim_y = FRUSTUM_CLAMP_FACTOR * max(cy, height - cy) / fy
+    x_ndc = x * invz
+    y_ndc = y * invz
+    x_ndc_clamped = x_ndc.clamp(min=-lim_x, max=lim_x)
+    y_ndc_clamped = y_ndc.clamp(min=-lim_y, max=lim_y)
+    x_ndc_for_cov = torch.where(torch.abs(x_ndc) <= lim_x, x_ndc, x_ndc_clamped.detach())
+    y_ndc_for_cov = torch.where(torch.abs(y_ndc) <= lim_y, y_ndc, y_ndc_clamped.detach())
     J[:, 0, 0] = fx * invz
     J[:, 1, 1] = fy * invz
-    J[:, 0, 2] = -fx * x * invz2
-    J[:, 1, 2] = -fy * y * invz2
+    J[:, 0, 2] = -fx * x_ndc_for_cov * invz
+    J[:, 1, 2] = -fy * y_ndc_for_cov * invz
     cov_img = J @ cov_cam @ J.transpose(1, 2)  # (M, 2, 2)
+    cov_img[:, 0, 0] = cov_img[:, 0, 0] + LOW_PASS_FILTER
+    cov_img[:, 1, 1] = cov_img[:, 1, 1] + LOW_PASS_FILTER
 
     # valid mask for Gaussians that have positive definite covariances
     cov_img = (cov_img + cov_img.transpose(1, 2)) / 2  # ensure symmetry
@@ -98,7 +112,7 @@ def render(
     z = z[valid_mask]  # (K,)
     cov_img = cov_img[valid_mask]  # (K, 2, 2)
     if u_img.shape[0] == 0:
-        return torch.zeros((height, width, 3), device=means.device, dtype=means.dtype)
+        return torch.zeros((height, width, 3), device=means.device, dtype=means.dtype), None, None
 
     # valid mask for Gaussians that project within the image boundaries
     extend = 3  # extend up to 3 standard deviations to account for the Gaussian tails
@@ -127,7 +141,7 @@ def render(
     cov_img = cov_img[within_image_mask]  # (L, 2, 2)
     L = u_img.shape[0]
     if L == 0:
-        return torch.zeros((height, width, 3), device=means.device, dtype=means.dtype)
+        return torch.zeros((height, width, 3), device=means.device, dtype=means.dtype), None, None
 
     # global sorting by depth for correct compositing order (near to far)
     order = torch.argsort(z, descending=False)

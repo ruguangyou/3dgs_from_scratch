@@ -34,6 +34,8 @@ void launch_project_points_backward_kernel(
     const torch::Tensor intrinsic,
     const torch::Tensor cov_image,
     const torch::Tensor mask,
+    const int32_t width,
+    const int32_t height,
     torch::Tensor grad_points_world,
     torch::Tensor grad_scales,
     torch::Tensor grad_quaternions
@@ -197,6 +199,8 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> project_points_backward(
     const torch::Tensor opacities,  // (N,)
     const torch::Tensor world_to_camera,  // (4, 4)
     const torch::Tensor intrinsic,  // (3, 3)
+    const int32_t width,
+    const int32_t height,
     const torch::Tensor cov_image,  // (N, 3)
     const torch::Tensor mask  // (N,)
 ) {
@@ -217,6 +221,8 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> project_points_backward(
         intrinsic,
         cov_image,
         mask,
+        width,
+        height,
         grad_points_world,
         grad_scales,
         grad_quaternions

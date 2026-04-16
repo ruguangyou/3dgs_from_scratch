@@ -287,7 +287,7 @@ def train(
 
 if __name__ == "__main__":
     train(
-        max_steps=30000,
+        max_steps=5000,
         downsample_points=False,
         initial_max_points=50000,
         use_cuda_rasterizer=True,
