@@ -52,6 +52,7 @@ def test(use_cuda_rasterizer=True):
                 opacity,
                 f_dc,
                 f_rest,
+                sh_sigmoid=True,
             )
             print("saving frame", i)
 

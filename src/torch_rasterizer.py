@@ -22,6 +22,7 @@ def render(
     transmittance_threshold=1e-4,
     chi_squared_threshold=9.21,  # 99% confidence interval for 2 DOF
     device="cuda",
+    sh_sigmoid=False,
 ):
     world_to_camera = world_to_camera.to(device)  # (4, 4)
     intrinsic = intrinsic.to(device)  # (3, 3)
@@ -55,7 +56,9 @@ def render(
     camera_pos = -world_to_camera[:3, :3].t() @ world_to_camera[:3, 3]  # (3,)
     view_dirs = means[valid_depth_mask] - camera_pos.unsqueeze(0)  # (M, 3)
     view_dirs = view_dirs / torch.norm(view_dirs, dim=1, keepdim=True)
-    colors = evaluate_spherical_harmonics(sh_coeffs_dc, sh_coeffs_rest, view_dirs)  # (M, 3)
+    colors = evaluate_spherical_harmonics(
+        sh_coeffs_dc, sh_coeffs_rest, view_dirs, sh_sigmoid
+    )  # (M, 3)
 
     # project Gaussian to image plane
     x, y, z = points_cam.unbind(0)  # (M,)

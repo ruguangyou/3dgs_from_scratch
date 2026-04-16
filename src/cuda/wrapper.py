@@ -76,15 +76,17 @@ class ProjectPointsFunction(torch.autograd.Function):
 
 class SphericalHarmonicsFunction(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, camera_pos, means, sh_coeffs_dc, sh_coeffs_rest, mask):
+    def forward(ctx, camera_pos, means, sh_coeffs_dc, sh_coeffs_rest, mask, sh_sigmoid=False):
         colors = cuda_rasterizer.evaluate_spherical_harmonics(
             camera_pos.contiguous(),
             means.contiguous(),
             sh_coeffs_dc.contiguous(),
             sh_coeffs_rest.contiguous(),
             mask.contiguous(),
+            sh_sigmoid,
         )
         ctx.save_for_backward(camera_pos, means, sh_coeffs_dc, sh_coeffs_rest, colors, mask)
+        ctx.sh_sigmoid = sh_sigmoid
         return colors
 
     @staticmethod
@@ -98,10 +100,11 @@ class SphericalHarmonicsFunction(torch.autograd.Function):
                 sh_coeffs_dc.contiguous(),
                 sh_coeffs_rest.contiguous(),
                 colors.contiguous(),
+                ctx.sh_sigmoid,
                 mask.contiguous(),
             )
         )
-        return None, grad_means, grad_sh_coeffs_dc, grad_sh_coeffs_rest, None
+        return None, grad_means, grad_sh_coeffs_dc, grad_sh_coeffs_rest, None, None
 
 
 class RasterizeFunction(torch.autograd.Function):
@@ -225,6 +228,7 @@ def render(
     alpha_threshold=1e-4,
     transmittance_threshold=1e-4,
     chi_squared_threshold=9.21,  # 99% confidence interval for 2 DOF
+    sh_sigmoid=False,
 ):
     points_img, depths, cov_inv_img, radii, mask = ProjectPointsFunction.apply(
         means,
@@ -243,7 +247,9 @@ def render(
     )
 
     camera_pos = -world_to_camera[:3, :3].t() @ world_to_camera[:3, 3]
-    colors = SphericalHarmonicsFunction.apply(camera_pos, means, sh_coeffs_dc, sh_coeffs_rest, mask)
+    colors = SphericalHarmonicsFunction.apply(
+        camera_pos, means, sh_coeffs_dc, sh_coeffs_rest, mask, sh_sigmoid
+    )
 
     tile_size = 16
     indexing_offset, gaussian_ids_sorted = cuda_rasterizer.compute_tile_intersection(

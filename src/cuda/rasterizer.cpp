@@ -45,6 +45,7 @@ void launch_evaluate_spherical_harmonics_kernel(
     const torch::Tensor sh_coeffs_dc,
     const torch::Tensor sh_coeffs_rest,
     const torch::Tensor mask,
+    const bool sh_sigmoid,
     torch::Tensor colors
 );
 
@@ -56,6 +57,7 @@ void launch_evaluate_spherical_harmonics_backward_kernel(
     const torch::Tensor sh_coeffs_rest,
     const torch::Tensor colors,
     const torch::Tensor mask,
+    const bool sh_sigmoid,
     torch::Tensor grad_points_world,
     torch::Tensor grad_sh_coeffs_dc,
     torch::Tensor grad_sh_coeffs_rest
@@ -228,7 +230,8 @@ torch::Tensor evaluate_spherical_harmonics(
     const torch::Tensor points_world,  // (N, 3)
     const torch::Tensor sh_coeffs_dc,  // (N, 3)
     const torch::Tensor sh_coeffs_rest,  // (N, 15, 3)
-    const torch::Tensor mask  // (N,)
+    const torch::Tensor mask,  // (N,)
+    const bool sh_sigmoid = false
 ) {
     int N = points_world.size(0);
     auto float_options = points_world.options().dtype(torch::kFloat32);
@@ -240,6 +243,7 @@ torch::Tensor evaluate_spherical_harmonics(
         sh_coeffs_dc,
         sh_coeffs_rest,
         mask,
+        sh_sigmoid,
         colors
     );
 
@@ -253,6 +257,7 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> evaluate_spherical_harmo
     const torch::Tensor sh_coeffs_dc,  // (N, 3)
     const torch::Tensor sh_coeffs_rest,  // (N, 15, 3)
     const torch::Tensor colors,  // (N, 3)
+    const bool sh_sigmoid,  // whether the forward pass applies sigmoid to the output color
     const torch::Tensor mask  // (N,)
 ) {
     int N = points_world.size(0);
@@ -269,6 +274,7 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> evaluate_spherical_harmo
         sh_coeffs_rest,
         colors,
         mask,
+        sh_sigmoid,
         grad_points_world,
         grad_sh_coeffs_dc,
         grad_sh_coeffs_rest

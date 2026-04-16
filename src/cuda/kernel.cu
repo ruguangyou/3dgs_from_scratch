@@ -516,6 +516,7 @@ __global__ void evaluate_spherical_harmonics_kernel(
     const float *sh_coeffs_dc,  // (N*3,)
     const float *sh_coeffs_rest,  // (N*15*3,)
     const bool *mask,  // (N,)
+    const bool sh_sigmoid,  // whether to apply sigmoid to the output color
     float *colors  // (N*3,)
 ) {
     int32_t idx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -569,10 +570,17 @@ __global__ void evaluate_spherical_harmonics_kernel(
         b += sh_basis[i+1] * sh_coeffs_rest[(idx*15 + i)*3 + 2];
     }
 
-    // normalize color to [0, 1] with sigmoid
-    colors[idx*3] = 1.0 / (1.0 + expf(-r));
-    colors[idx*3 + 1] = 1.0 / (1.0 + expf(-g));
-    colors[idx*3 + 2] = 1.0 / (1.0 + expf(-b));
+    if (sh_sigmoid) {
+        // normalize color to [0, 1] with sigmoid
+        colors[idx*3] = 1.0 / (1.0 + expf(-r));
+        colors[idx*3 + 1] = 1.0 / (1.0 + expf(-g));
+        colors[idx*3 + 2] = 1.0 / (1.0 + expf(-b));
+    }
+    else {
+        colors[idx*3] = r;
+        colors[idx*3 + 1] = g;
+        colors[idx*3 + 2] = b;
+    }
 }
 
 __global__ void evaluate_spherical_harmonics_backward_kernel(
@@ -584,6 +592,7 @@ __global__ void evaluate_spherical_harmonics_backward_kernel(
     const float *sh_coeffs_rest,  // (N*15*3,)
     const float *colors,  // (N*3,)
     const bool *mask,  // (N,)
+    const bool sh_sigmoid,  // whether sigmoid was applied to the output color
     float *grad_points_world,  // (N*3,)
     float *grad_sh_coeffs_dc,  // (N*3,)
     float *grad_sh_coeffs_rest  // (N*15*3,)
@@ -693,10 +702,15 @@ __global__ void evaluate_spherical_harmonics_backward_kernel(
     float j21 = -yz * inv_norm;
     float j22 = (1.0f - zz) * inv_norm;
 
-    // compute sigmoid gradient
-    float grad_r = colors[idx*3] * (1.0f - colors[idx*3]) * grad_colors[idx*3];
-    float grad_g = colors[idx*3 + 1] * (1.0f - colors[idx*3 + 1]) * grad_colors[idx*3 + 1];
-    float grad_b = colors[idx*3 + 2] * (1.0f - colors[idx*3 + 2]) * grad_colors[idx*3 + 2];
+    float grad_r = grad_colors[idx*3];
+    float grad_g = grad_colors[idx*3 + 1];
+    float grad_b = grad_colors[idx*3 + 2];
+    if (sh_sigmoid) {
+        // compute sigmoid gradient
+        grad_r *= colors[idx*3] * (1.0f - colors[idx*3]);
+        grad_g *= colors[idx*3 + 1] * (1.0f - colors[idx*3 + 1]);
+        grad_b *= colors[idx*3 + 2] * (1.0f - colors[idx*3 + 2]);
+    }
 
     // compute gradient w.r.t. sh_coeffs_dc
     grad_sh_coeffs_dc[idx*3] = grad_r * sh_basis[0];
@@ -1161,6 +1175,7 @@ void launch_evaluate_spherical_harmonics_kernel(
     const torch::Tensor sh_coeffs_dc,
     const torch::Tensor sh_coeffs_rest,
     const torch::Tensor mask,
+    const bool sh_sigmoid,
     torch::Tensor colors
 ) {
     int N = points_world.size(0);
@@ -1177,6 +1192,7 @@ void launch_evaluate_spherical_harmonics_kernel(
         sh_coeffs_dc.data_ptr<float>(),
         sh_coeffs_rest.data_ptr<float>(),
         mask.data_ptr<bool>(),
+        sh_sigmoid,
         colors.data_ptr<float>()
     );
     C10_CUDA_KERNEL_LAUNCH_CHECK();
@@ -1190,6 +1206,7 @@ void launch_evaluate_spherical_harmonics_backward_kernel(
     const torch::Tensor sh_coeffs_rest,
     const torch::Tensor colors,
     const torch::Tensor mask,
+    const bool sh_sigmoid,
     torch::Tensor grad_points_world,
     torch::Tensor grad_sh_coeffs_dc,
     torch::Tensor grad_sh_coeffs_rest
@@ -1210,6 +1227,7 @@ void launch_evaluate_spherical_harmonics_backward_kernel(
         sh_coeffs_rest.data_ptr<float>(),
         colors.data_ptr<float>(),
         mask.data_ptr<bool>(),
+        sh_sigmoid,
         grad_points_world.data_ptr<float>(),
         grad_sh_coeffs_dc.data_ptr<float>(),
         grad_sh_coeffs_rest.data_ptr<float>()

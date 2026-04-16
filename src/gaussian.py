@@ -21,7 +21,7 @@ SH_C3_zxx_zyy = 1.445305721320277
 SH_C3_xxx_xyy = 0.5900435899266435
 
 
-def evaluate_spherical_harmonics(sh_coeffs_dc, sh_coeffs_rest, view_dirs):
+def evaluate_spherical_harmonics(sh_coeffs_dc, sh_coeffs_rest, view_dirs, sh_sigmoid=False):
     # sh_coeffs_dc shape: (N, 3) for degree 0
     # sh_coeffs_rest shape: (N, 15, 3) for degree 1,2,3
     # view_dirs shape: (N, 3)
@@ -53,9 +53,9 @@ def evaluate_spherical_harmonics(sh_coeffs_dc, sh_coeffs_rest, view_dirs):
 
     sh_dc = sh_coeffs_dc * SH_C0  # (N, 3)
     sh_rest = (sh_coeffs_rest * sh_basis_rest.unsqueeze(-1)).sum(dim=1)  # (N, 3)
+    sh = sh_dc + sh_rest  # (N, 3)
 
-    # normalize color to [0, 1] with sigmoid
-    return torch.sigmoid(sh_dc + sh_rest)  # (N, 3)
+    return torch.sigmoid(sh) if sh_sigmoid else sh  # (N, 3)
 
 
 def quaternion_to_rotation_matrix(quaternions):
