@@ -80,9 +80,12 @@ def resize_camera(camera, image_scale: float):
         .squeeze(0)
     )  # (1, C, H, W) -> (H, W, C)
 
+    intrinsic = camera["intrinsic"] * image_scale
+    intrinsic[..., 2, 2] = 1.0  # keep the homogeneous scale term unchanged
+
     return {
         "world_to_camera": camera["world_to_camera"],
-        "intrinsic": camera["intrinsic"] * image_scale,
+        "intrinsic": intrinsic,
         "image": resized_image,
     }
 
