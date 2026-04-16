@@ -263,8 +263,8 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> evaluate_spherical_harmo
     const torch::Tensor sh_coeffs_dc,  // (N, 3)
     const torch::Tensor sh_coeffs_rest,  // (N, 15, 3)
     const torch::Tensor colors,  // (N, 3)
-    const bool sh_sigmoid,  // whether the forward pass applies sigmoid to the output color
-    const torch::Tensor mask  // (N,)
+    const torch::Tensor mask,  // (N,)
+    const bool sh_sigmoid  // whether the forward pass applies sigmoid to the output color
 ) {
     int N = points_world.size(0);
     auto float_options = grad_colors.options().dtype(torch::kFloat32);

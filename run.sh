@@ -18,7 +18,9 @@ elif [ "$1" = "gradcheck" ]; then
     PYTHONPATH="${PROJECT_ROOT}" "${PYTHON_BIN}" -m scripts.check_cuda_gradients --seeds "${SEEDS}" --device cuda
 elif [ "$1" = "benchmark" ]; then
     PYTHONPATH="${PROJECT_ROOT}" "${PYTHON_BIN}" -m scripts.benchmark_rasterizers "${@:2}"
+elif [ "$1" = "build" ]; then
+    PYTHONPATH="${PROJECT_ROOT}" "${PYTHON_BIN}" setup.py build_ext --inplace
 else
-    echo "Usage: $0 {train|evaluate|test|gradcheck [seeds]|benchmark [args...]}"
+    echo "Usage: $0 {train|evaluate|test|gradcheck [seeds]|benchmark [args...]|build}"
     exit 1
 fi

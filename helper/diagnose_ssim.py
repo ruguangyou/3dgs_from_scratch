@@ -6,7 +6,7 @@ from fused_ssim import fused_ssim
 from src.cuda.wrapper import render as cuda_render
 from src.torch_rasterizer import render as torch_render
 from src.gaussian import downsample_point_cloud, initialize
-from src.dataset import Dataset
+from src.dataset import Dataset, resize_camera
 
 
 def main():
@@ -21,10 +21,18 @@ def main():
     rgbs = torch.from_numpy(rgbs / 255.0).float()
     base_params = initialize(points, rgbs, sh_degree=3)
 
-    train_dataset = Dataset(camera_data, image_scale=0.5, split="train")
+    train_dataset = Dataset(camera_data, split="train")
     sample = train_dataset[0]
-    w2c = sample["world_to_camera"].to(device)
-    intrinsic = sample["intrinsic"].to(device)
+    sample = resize_camera(
+        {
+            "world_to_camera": sample["world_to_camera"].unsqueeze(0),
+            "intrinsic": sample["intrinsic"].unsqueeze(0),
+            "image": sample["image"].unsqueeze(0),
+        },
+        0.5,
+    )
+    w2c = sample["world_to_camera"].squeeze(0).to(device)
+    intrinsic = sample["intrinsic"].squeeze(0).to(device)
     target = sample["image"].to(device)
     H, W = target.shape[0], target.shape[1]
 

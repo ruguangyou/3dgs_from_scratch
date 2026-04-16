@@ -1,3 +1,10 @@
+from pathlib import Path
+import sys
+
+_SRC_DIR = Path(__file__).resolve().parents[1]
+if str(_SRC_DIR) not in sys.path:
+    sys.path.insert(0, str(_SRC_DIR))
+
 import cuda_rasterizer
 import torch
 
@@ -104,8 +111,8 @@ class SphericalHarmonicsFunction(torch.autograd.Function):
                 sh_coeffs_dc.contiguous(),
                 sh_coeffs_rest.contiguous(),
                 colors.contiguous(),
-                ctx.sh_sigmoid,
                 mask.contiguous(),
+                ctx.sh_sigmoid,
             )
         )
         return None, grad_means, grad_sh_coeffs_dc, grad_sh_coeffs_rest, None, None

@@ -22,6 +22,7 @@ constexpr float SH_C3_zxx_zyy = 1.445305721320277;
 constexpr float SH_C3_xxx_xyy = 0.5900435899266435;
 constexpr float LOW_PASS_FILTER = 0.3f;
 constexpr float FRUSTUM_CLAMP_FACTOR = 1.3f;
+constexpr float TRANSMITTANCE_EPS = 1e-10f;
 
 __device__ void transform_w2c(
     const float *world_to_camera,
@@ -744,9 +745,9 @@ __global__ void evaluate_spherical_harmonics_backward_kernel(
         grad_b *= colors[idx*3 + 2] * (1.0f - colors[idx*3 + 2]);
     }
     else {
-        grad_r *= (colors[idx*3] + 0.5f) > 0.0f ? 1.0f : 0.0f;
-        grad_g *= (colors[idx*3 + 1] + 0.5f) > 0.0f ? 1.0f : 0.0f;
-        grad_b *= (colors[idx*3 + 2] + 0.5f) > 0.0f ? 1.0f : 0.0f;
+        grad_r *= colors[idx*3] > 0.0f ? 1.0f : 0.0f;
+        grad_g *= colors[idx*3 + 1] > 0.0f ? 1.0f : 0.0f;
+        grad_b *= colors[idx*3 + 2] > 0.0f ? 1.0f : 0.0f;
     }
 
     // compute gradient w.r.t. sh_coeffs_dc
@@ -978,7 +979,8 @@ __global__ void rasterize_kernel(
         g += weight * colors[gaussian_id*3 + 1];
         b += weight * colors[gaussian_id*3 + 2];
 
-        transmittance *= (1.0f - alpha);
+        float one_minus_alpha = 1.0f - alpha + TRANSMITTANCE_EPS;
+        transmittance *= one_minus_alpha;
         if (transmittance < transmittance_threshold) {
             break;
         }
@@ -1054,7 +1056,8 @@ __global__ void rasterize_backward_kernel(
             continue;
         }
 
-        final_transmittance *= (1.0f - alpha);
+        float one_minus_alpha = 1.0f - alpha + TRANSMITTANCE_EPS;
+        final_transmittance *= one_minus_alpha;
         if (final_transmittance < transmittance_threshold) {
             active_end = i + 1;
             break;
@@ -1086,14 +1089,14 @@ __global__ void rasterize_backward_kernel(
             continue;
         }
 
-        float one_minus_alpha = 1.0f - alpha;
-        float prefix_transmittance = transmittance_after / (one_minus_alpha + 1e-8f);
+        float one_minus_alpha = 1.0f - alpha + TRANSMITTANCE_EPS;
+        float prefix_transmittance = transmittance_after / one_minus_alpha;
         float weight = alpha * prefix_transmittance;
         float grad_rgb = grad_r * colors[gaussian_id*3] +
                          grad_g * colors[gaussian_id*3 + 1] +
                          grad_b * colors[gaussian_id*3 + 2];
         float grad_alpha = prefix_transmittance * grad_rgb -
-                           suffix_weighted_color / (one_minus_alpha + 1e-8f);
+                           suffix_weighted_color / one_minus_alpha;
         float grad_u = inv_cov_00 * du + inv_cov_01 * dv;
         float grad_v = inv_cov_01 * du + inv_cov_11 * dv;
 
