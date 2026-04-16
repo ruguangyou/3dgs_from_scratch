@@ -55,7 +55,10 @@ def evaluate_spherical_harmonics(sh_coeffs_dc, sh_coeffs_rest, view_dirs, sh_sig
     sh_rest = (sh_coeffs_rest * sh_basis_rest.unsqueeze(-1)).sum(dim=1)  # (N, 3)
     sh = sh_dc + sh_rest  # (N, 3)
 
-    return torch.sigmoid(sh) if sh_sigmoid else sh  # (N, 3)
+    if sh_sigmoid:
+        return torch.sigmoid(sh)
+
+    return torch.clamp_min(sh + 0.5, 0.0)  # (N, 3)
 
 
 def quaternion_to_rotation_matrix(quaternions):

@@ -66,5 +66,5 @@ def evaluate(ckpt_path, use_cuda_rasterizer=True):
 
 
 if __name__ == "__main__":
-    ckpt_path = "logs/trained_gaussians_5000.pth"  # Update this path if needed
+    ckpt_path = "logs/trained_gaussians_7000.pth"  # Update this path if needed
     evaluate(ckpt_path, use_cuda_rasterizer=True)
