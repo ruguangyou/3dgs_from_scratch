@@ -802,6 +802,7 @@ def check_sh(seed: int, device: str, thresholds: Thresholds) -> bool:
     colors_cuda = SphericalHarmonicsFunction.apply(
         camera_pos, means_cuda, sh_dc_cuda, sh_rest_cuda, mask
     )
+    colors_cuda = torch.clamp_min(colors_cuda + 0.5, 0.0)
     loss_cuda = (colors_cuda * 0.3).sum()
     loss_cuda.backward()
 

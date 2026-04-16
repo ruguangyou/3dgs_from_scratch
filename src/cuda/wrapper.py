@@ -261,6 +261,8 @@ def render(
     colors = SphericalHarmonicsFunction.apply(
         camera_pos, means, sh_coeffs_dc, sh_coeffs_rest, mask, sh_sigmoid
     )
+    if not sh_sigmoid:
+        colors = torch.clamp_min(colors + 0.5, 0.0)  # shift from [-0.5, 0.5] to [0, inf)
 
     tile_size = 16
     indexing_offset, gaussian_ids_sorted = cuda_rasterizer.compute_tile_intersection(

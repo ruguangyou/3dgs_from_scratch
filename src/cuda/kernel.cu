@@ -610,9 +610,9 @@ __global__ void evaluate_spherical_harmonics_kernel(
         colors[idx*3 + 2] = 1.0 / (1.0 + expf(-b));
     }
     else {
-        colors[idx*3] = fmaxf(r + 0.5f, 0.0f);
-        colors[idx*3 + 1] = fmaxf(g + 0.5f, 0.0f);
-        colors[idx*3 + 2] = fmaxf(b + 0.5f, 0.0f);
+        colors[idx*3] = r;
+        colors[idx*3 + 1] = g;
+        colors[idx*3 + 2] = b;
     }
 }
 
@@ -743,11 +743,6 @@ __global__ void evaluate_spherical_harmonics_backward_kernel(
         grad_r *= colors[idx*3] * (1.0f - colors[idx*3]);
         grad_g *= colors[idx*3 + 1] * (1.0f - colors[idx*3 + 1]);
         grad_b *= colors[idx*3 + 2] * (1.0f - colors[idx*3 + 2]);
-    }
-    else {
-        grad_r *= colors[idx*3] > 0.0f ? 1.0f : 0.0f;
-        grad_g *= colors[idx*3 + 1] > 0.0f ? 1.0f : 0.0f;
-        grad_b *= colors[idx*3 + 2] > 0.0f ? 1.0f : 0.0f;
     }
 
     // compute gradient w.r.t. sh_coeffs_dc
